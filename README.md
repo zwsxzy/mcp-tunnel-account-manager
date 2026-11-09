@@ -44,7 +44,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\open-portable-cons
 
 ## 上一版 Release 的 Windows 部署（rc20 / v1.2.0-preview.3，历史版本与依赖参考）
 
-目标平台：Windows 10/11 x64。普通用户无需从源码安装依赖。以下步骤对当前 `v1.2.0-preview.4` 同样适用，仅需把链接替换为上表对应附件。
+目标平台：Windows 10/11 x64。普通用户无需从源码安装依赖。以下步骤对当前 `v1.2.0-preview.5` 同样适用，仅需把链接替换为上表对应附件。
 
 1. 从上表或 [上一版 Release](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/tag/v1.2.0-preview.3) 下载 **[完整部署包](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.3/MCP-Windows-Deployment-Kit-20261108-rc20-r1.zip)** 和 [SHA256 校验清单](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.3/SHA256SUMS.txt)。
 2. 对照清单核验下载文件，解压到短、固定、当前用户可写的目录，如 `C:\MCP` 或 `D:\MCP`。不要放在过深目录或直接从 ZIP 内运行。
@@ -56,7 +56,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Verify-Package.ps1
 ```
 
 4. 浏览器默认打开 <http://127.0.0.1:17642>。按照本机初始化提示设置管理密码；不要公开初始化码。
-5. 可选运行根目录的快捷方式安装器。配置服务、独立 Tunnel ID、凭据输入、升级隔离和停止方式请看 [完整中文部署说明](docs/releases/v1.2.0-preview.4/README-Release.zh-CN.md)。
+5. 可选运行根目录的快捷方式安装器。配置服务、独立 Tunnel ID、凭据输入、升级隔离和停止方式请看 [完整中文部署说明](docs/releases/v1.2.0-preview.5/README-Release.zh-CN.md)。
 
 > `new` 分支带来的两个修复只对**下次启动或切换**生效：已有窗口不会被强行隐藏或关闭，当前 MCP/DSH 不会因安装源码而重启。边界与重装步骤见 [合并版部署与验证边界](docs/NEW-BRANCH-DEPLOY.zh-CN.md)。
 
@@ -76,9 +76,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\oneclick\Install-Desktop-S
 
 | 附件 | 用途 |
 | --- | --- |
-| [完整部署包，约 68.9 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.4/MCP-Windows-Deployment-Kit-20261109-rc21-r1.zip) | **推荐其他电脑部署**；整合 `main` 与 `new` 分支修复，不需要叠加解压另一个控制台包 |
-| [控制台便携包，约 36.0 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.4/MCP-Tunnel-Console-Windows-x64-20261109-rc21-r1.zip) | 控制台与 Node；适合已有服务和隧道程序的人 |
-| [源码与打包工具，约 0.358 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.4/MCP-Tunnel-Console-Source-20261109-rc21-r1.zip) | 固定 RC21 发行源码与构建工具；没有 Node 或服务运行依赖 |
+| [完整部署包，约 65.8 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.5/MCP-Windows-Deployment-Kit-20261109-rc22-r1.zip) | **推荐其他电脑部署**；整合 `main`、`new` 与并发账号隧道特性，不需要叠加解压另一个控制台包 |
+| [控制台便携包，约 34.4 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.5/MCP-Tunnel-Console-Windows-x64-20261109-rc22-r1.zip) | 控制台与 Node；适合已有服务和隧道程序的人 |
+| [源码与打包工具，约 0.4 MB](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.5/MCP-Tunnel-Console-Source-20261109-rc22-r1.zip) | 固定 RC22 发行源码与构建工具；没有 Node 或服务运行依赖 |
+| [SHA256 校验清单](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/download/v1.2.0-preview.5/SHA256SUMS.txt) | 三个 ZIP 的 SHA256 摘要 |
 
 GitHub 自动生成的 Source code ZIP 对应 tag 的仓库源码，包含这里的开发文件，但**不是完整部署包**。旧的 [deployment/windows](deployment/windows) 保留早期源码与指南；最新发行外壳以 [packaging/windows/templates](packaging/windows/templates) 为准，不要将旧目录覆盖到新包。
 
@@ -126,11 +127,11 @@ npm.cmd run test:release
 ## 构建、版本和验证
 
 - [离线构建说明](docs/BUILD-RELEASE.md)：固定允许的源码和模板输入、拒绝私密/运行数据、生成逐文件哈希；输出目录不能覆盖既有内容。
-- [本次发布说明](docs/releases/v1.2.0-preview.4/RELEASE_NOTES.zh-CN.md)
-- [隔离验证报告](docs/releases/v1.2.0-preview.4/VALIDATION.zh-CN.md)及[机器可读报告](docs/releases/v1.2.0-preview.4/validation-report.json)
-- [上一版发布说明](docs/releases/v1.2.0-preview.3/RELEASE_NOTES.zh-CN.md)
+- [本次发布说明](docs/releases/v1.2.0-preview.5/RELEASE_NOTES.zh-CN.md)
+- [隔离验证报告](docs/releases/v1.2.0-preview.5/VALIDATION.zh-CN.md)及[机器可读报告](docs/releases/v1.2.0-preview.5/validation-report.json)
+- [上一版发布说明](docs/releases/v1.2.0-preview.4/RELEASE_NOTES.zh-CN.md)
 
-发行包中的 35 个核心业务文件以合并后的源码重新计算哈希并记录在 `source-core-hashes.json`（构建标识 `20261109-rc21-r1`，取代 RC19/RC20 基线）。三个分发包各 4 项发行测试；Windows 启停、快捷方式和配置向导经过隔离检查；Overleaf/Antigravity 通过 MCP 初始化与工具发现，未执行业务工具或模型任务。
+发行包中的 39 个核心业务文件以合并后的源码重新计算哈希并记录在 `source-core-hashes.json`（构建标识 `20261109-rc22-r1`，取代 RC19/RC20/RC21 基线）。三个分发包各 4 项发行测试；Windows 启停、快捷方式和配置向导经过隔离检查；Overleaf/Antigravity 通过 MCP 初始化与工具发现，未执行业务工具或模型任务。
 
 这些结果不是第二台实体机、真实公网隧道、Overleaf 读写/推送/编译、Antigravity 任务或 DSH 端到端验收，也不构成漏洞、真实性、数字签名或法律合规审计。
 

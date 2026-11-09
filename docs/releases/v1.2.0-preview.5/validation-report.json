@@ -1,0 +1,74 @@
+{
+  "releaseId": "20261109-rc22-r1",
+  "applicationVersion": "1.0.0",
+  "releaseTag": "v1.2.0-preview.5",
+  "platform": "win32-x64",
+  "verificationScope": "local-offline-only",
+  "checks": {
+    "archiveIntegrity": {
+      "status": "passed",
+      "note": "Three ZIPs: CRC, safe archive paths and hashes all passed; no traversal, link or case-collision entries."
+    },
+    "perFileHashes": {
+      "status": "passed",
+      "sourcePackage": 96,
+      "consolePackage": 98,
+      "completeKit": 1648,
+      "note": "Counts exclude the checksum manifest itself."
+    },
+    "coreSourceBaseline": {
+      "status": "passed",
+      "coreFiles": 39,
+      "note": "Core business files re-hashed against the merged tree and locked in source-core-hashes.json; the three consoles are byte-identical."
+    },
+    "privacyAudit": {
+      "status": "passed",
+      "findings": 0,
+      "note": "All three packages: 0 findings for sensitive words, private keys, databases, environment values and personal paths."
+    },
+    "syntaxCheck": {
+      "status": "passed",
+      "files": 122
+    },
+    "shippedReleaseTests": {
+      "status": "passed",
+      "perPackage": "4/4",
+      "total": "12/12",
+      "note": "Bounded deployment suite shipped with each package; not the complete upstream regression suite."
+    },
+    "fullUnitSuite": {
+      "status": "passed",
+      "files": "45/45"
+    },
+    "regressionTestsProveFix": {
+      "status": "passed",
+      "cases": [
+        "prepare survives a -restored process-record tag by reusing the packet own operationId",
+        "removal resolves runtimeState when no tunnelClient observation exists",
+        "removal prefers tunnelClient over stale runtimeState",
+        "removal still blocks when observed tunnel client is running"
+      ],
+      "note": "Each new case was verified to fail with the fix reverted, and to pass with it restored."
+    },
+    "offlineRebuild": {
+      "status": "passed",
+      "note": "Rebuilding with the shipped tooling reproduces the three released trees exactly."
+    }
+  },
+  "knownIssues": [
+    {
+      "id": "third-mcp-e2e",
+      "status": "fails-locally",
+      "preExisting": true,
+      "detail": "Third MCP E2E requires a real control-plane verification target and fails in this environment. The same failure occurs on HEAD before this change set."
+    }
+  ],
+  "notCovered": [
+    "Second physical machine acceptance",
+    "Real public-network tunnel",
+    "Overleaf read/write/push/compile",
+    "Antigravity task execution",
+    "DSH end-to-end acceptance",
+    "Security, authenticity, code-signing or legal compliance audit"
+  ]
+}

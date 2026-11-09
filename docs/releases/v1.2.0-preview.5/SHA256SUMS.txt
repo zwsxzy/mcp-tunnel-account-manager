@@ -1,0 +1,3 @@
+﻿cf035e64a990ff1644cc6b7e39ad9055177f16bdd42faa3798d3e08bf1ffb90e  MCP-Tunnel-Console-Source-20261109-rc22-r1.zip
+85c4d06cea600edc154f79a92c298016713c0a5c8c635b8847448f206aad927c  MCP-Tunnel-Console-Windows-x64-20261109-rc22-r1.zip
+986b7f85cc59e496980324ba66d27694c608ea5709fabe5e1485e4c182db95fa  MCP-Windows-Deployment-Kit-20261109-rc22-r1.zip
