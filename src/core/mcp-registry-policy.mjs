@@ -62,6 +62,13 @@ export function assertStoppedConnectionReceipt(receipt, operationId, serviceId) 
        typeof receipt.identity.executable!=='string' || !receipt.identity.executable)) {
     reject('STOP_UNCONFIRMED',409);
   }
+  // Concurrent-instance receipts carry an optional instanceId. It is additive only:
+  // the legacy shape (no instanceId) still passes untouched, and nothing above is
+  // tightened. When present it must at least be a bounded non-empty string.
+  if (receipt.instanceId!=null &&
+      (typeof receipt.instanceId!=='string' || receipt.instanceId.length===0 || receipt.instanceId.length>160)) {
+    reject('STOP_UNCONFIRMED',409);
+  }
   return true;
 }
 const RESERVED_ENV=/^(?:CONTROL_PLANE_|TUNNEL_CLIENT_|HEALTH_)/i;

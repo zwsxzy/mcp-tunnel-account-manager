@@ -672,12 +672,17 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
         }
       }
 
+      // Concurrent-instance scopes must never adopt a same-binary process by tag
+      // scan: a loopback of instances run the same tunnel-client.exe and only the
+      // instance-scoped runtime record may claim one of them.
+      const allowExternalScan = options?.allowExternalScan !== false;
+
       // Check for matched external process by known exact executable path AND service-specific profile/config identity
       const candidateExe = options?.executablePath || paths?.tunnelClientBin || (process.platform === 'win32' ? path.join(process.env.USERPROFILE || '', '.openai-tunnel', 'tunnel-client.exe') : null);
       const expectedProfile = options?.profileName || (service === 'overleaf-mcp' ? 'overleaf' : (service === 'antigravity-mcp' ? 'antigravity-local' : (service === 'mcp_dsh_chatgpt_bridge' ? 'dsh-bridge' : (options?.definition?.profileName || service || null))));
       const expectedConfig = options?.configPath || (service === 'overleaf-mcp' ? 'overleaf.yaml' : (service === 'antigravity-mcp' ? 'antigravity-local.yaml' : (service === 'mcp_dsh_chatgpt_bridge' ? 'dsh-bridge.yaml' : (options?.definition?.locations?.effectiveConfigPath ? path.basename(options.definition.locations.effectiveConfigPath) : (service ? `${service}.yaml` : null)))));
 
-      if (candidateExe && (fs.existsSync(candidateExe) || typeof runtimeCommand === 'function')) {
+      if (allowExternalScan && candidateExe && (fs.existsSync(candidateExe) || typeof runtimeCommand === 'function')) {
         if (!expectedProfile && !expectedConfig) {
           // If only same exe is known without service identity, do not attach an unrelated process
           return {
@@ -1207,13 +1212,23 @@ class ServiceAdapter {
     let originalPacket = null;
     let originalPacketPath = null;
     let originalOperationId = originalRuntime?.operationId || null;
+    // A process record written by restoreIfOwned() is tagged "<operationId>-restored" while its
+    // packetPath still points at the capsule sealed for the ORIGINAL operation. Only the packet's
+    // own operationId authenticates that envelope (it is bound into the AAD), so the transport
+    // context must never be derived from that suffix: doing so rejected every later start/restart
+    // with INVALID_HTTP_STATE.
+    const RESTORED_SUFFIX = '-restored';
+    const recordOperationId = typeof originalOperationId === 'string' &&
+      originalOperationId.endsWith(RESTORED_SUFFIX)
+      ? originalOperationId.slice(0, -RESTORED_SUFFIX.length)
+      : originalOperationId;
 
     if (originalRuntime?.transportKind === 'http' || originalRuntime?.kind === 'http' || originalRuntime?.packetPath) {
       originalKind = 'http';
-      originalPacketPath = originalRuntime.packetPath || (originalOperationId ? getHttpTransportPacketPath(this.dataDir, this.service, originalOperationId) : null);
-    } else if (originalOperationId) {
+      originalPacketPath = originalRuntime.packetPath || (recordOperationId ? getHttpTransportPacketPath(this.dataDir, this.service, recordOperationId) : null);
+    } else if (recordOperationId) {
       try {
-        const potentialPath = getHttpTransportPacketPath(this.dataDir, this.service, originalOperationId);
+        const potentialPath = getHttpTransportPacketPath(this.dataDir, this.service, recordOperationId);
         if (fs.existsSync(potentialPath)) {
           originalKind = 'http';
           originalPacketPath = potentialPath;
@@ -1234,7 +1249,13 @@ class ServiceAdapter {
       try {
         originalPacketBytes = fs.readFileSync(originalPacketPath);
         originalPacket = JSON.parse(originalPacketBytes.toString('utf8'));
-        await openHttpTransport(this.vault, originalPacket, { serviceId: this.service, operationId: originalOperationId });
+        // The capsule is the authority for its own operationId: it was sealed under that id and
+        // any other context fails unsealing/validation. Prefer it over the process-record tag.
+        const packetOperationId = typeof originalPacket?.operationId === 'string' && originalPacket.operationId
+          ? originalPacket.operationId
+          : recordOperationId;
+        if (packetOperationId) originalOperationId = packetOperationId;
+        await openHttpTransport(this.vault, originalPacket, { serviceId: this.service, operationId: packetOperationId });
       } catch (err) {
         if (err instanceof HttpTransportFault) throw err;
         throw new HttpTransportFault('HTTP_STATE_UNREADABLE');
@@ -2080,3 +2101,4 @@ export function createAdapters(options = {}) {
 }
 
 export { createRegisteredAdapterProvider } from './registry-provider.mjs';
+export { createInstanceAdapter, createInstanceAdapterProvider, InstanceAdapter } from './instance-adapter.mjs';

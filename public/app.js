@@ -58,6 +58,11 @@ export const SAFE_ERROR_MESSAGES = {
   INVALID_ACTION: '不受支持的操作动作。',
   ALREADY_RUNNING: '隧道客户端已在运行中。',
   ALREADY_STOPPED: '隧道客户端已处于停止状态。',
+  // Concurrent multi-account instance codes (docs/analysis/concurrent-instances-contract.md)
+  INVALID_INSTANCE: '实例标识不合法或与服务/账号不匹配。',
+  INVALID_SERVICE: '服务标识不合法。',
+  INVALID_PROFILE: '账号 / Profile 标识不合法。',
+  INSTANCE_LIMIT_REACHED: '该服务的并发实例数量已达上限（最多 8 个）。',
   SWITCH_FAILED: '切换未完成，请检查目标服务及配置。',
   VERIFY_FAILED: '目标隧道未通过严格健康与认证校验。',
   TARGET_VERIFICATION_UNAVAILABLE: '目标服务的切换前置检查未通过。',
@@ -104,7 +109,15 @@ export const appState = {
   selectedTunnelActionKind: null,
   tunnelActionCarrierToken: null,
   tunnelActionIdempotencyKey: null,
-  tunnelActionTimer: null
+  tunnelActionTimer: null,
+  // Concurrent multi-account instances (one MCP service, several tunnel profiles)
+  instanceSectionOverrides: new Map(),   // mcpId -> boolean | explicit user expand/collapse
+  instanceActionPending: new Map(),      // instanceRowKey -> 'start' | 'stop' | 'restart'
+  // instanceRowKey -> {carrierToken, idempotencyKey, action}. The server binds the
+  // carrier token to the Idempotency-Key it was issued for (carrier-confirmation.mjs),
+  // so the confirmation retry MUST reuse both verbatim.
+  instanceCarrierConfirmations: new Map(),
+  instancePollTimers: new Map()          // instanceRowKey -> instance poll state (cleared on settle/close)
 };
 
 // ==========================================================================
@@ -900,6 +913,8 @@ export async function handleLogout() {
       clearInterval(appState.operationPollingTimer);
       appState.operationPollingTimer = null;
     }
+    clearAllInstancePollTimers();
+    appState.instanceSectionOverrides.clear();
     showAlert('success', '已登出', '您已安全退出控制台。');
     await fetchAuthState();
   }
@@ -1862,8 +1877,512 @@ export function getTunnelStatusDescription(tc, mcp) {
   return tc.reasonCode ? (TUNNEL_CLIENT_REASON_LABELS[tc.reasonCode] || tc.reasonCode) : '状态就绪';
 }
 
+// ==========================================================================
+// Concurrent Multi-Account Instances (per MCP service)
+// Contract: docs/analysis/concurrent-instances-contract.md §4 / §5
+//
+// An MCP service may run SEVERAL tunnel-client processes at once, one per
+// account/profile. The server exposes them as `mcp.runtime.instances`, an array
+// of publicInstanceDTO records that are already redacted:
+//   instanceId, serviceId, profileId, profileLabel, state, managed, owned,
+//   identityVerified, pid, startedAt, healthURL, localPort, maskedTunnelId,
+//   operationId, reasonCode, lastExitCode, observedAt
+// `maskedTunnelId` is masked by the server: it is rendered verbatim and NEVER
+// unmasked or re-derived here. No api key or raw tunnel id can reach the DOM.
+// ==========================================================================
+
+const INSTANCE_TRANSITION_STATES = ['starting', 'stopping', 'restarting'];
+
+export function getMcpInstances(mcp) {
+  const list = mcp?.runtime?.instances;
+  return Array.isArray(list) ? list.filter(item => item && typeof item === 'object') : [];
+}
+
+export function buildInstanceRowKey(serviceId, profileId) {
+  return `${String(serviceId || '')}::${String(profileId || '')}`;
+}
+
+export function isInstanceInTransition(instance) {
+  return INSTANCE_TRANSITION_STATES.includes(instance?.state);
+}
+
+export function countRunningInstances(instances) {
+  if (!Array.isArray(instances)) return 0;
+  return instances.filter(item => item?.state === 'running').length;
+}
+
+// Collapsed by default for 0-1 instances; auto-expanded once >=2 are RUNNING.
+// An explicit user toggle always wins over the automatic decision.
+export function shouldExpandInstanceSection(mcpId, instances) {
+  const override = appState.instanceSectionOverrides.get(mcpId);
+  if (override === true || override === false) return override;
+  return countRunningInstances(instances) >= 2;
+}
+
+export function toggleInstanceSection(mcpId) {
+  if (!mcpId) return;
+  const mcp = appState.mcps.find(item => item.id === mcpId);
+  const instances = getMcpInstances(mcp);
+  const current = shouldExpandInstanceSection(mcpId, instances);
+  appState.instanceSectionOverrides.set(mcpId, !current);
+  renderMcpsRegistryGrid();
+}
+
+// Only loopback health endpoints are ever displayed; anything else is hidden.
+export function isLoopbackHealthURL(healthURL) {
+  if (!healthURL || typeof healthURL !== 'string') return false;
+  try {
+    const parsed = new URL(healthURL);
+    const host = (parsed.hostname || '').toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+export function formatInstanceEndpoint(instance) {
+  if (!instance || typeof instance !== 'object') return '-';
+  const port = Number.isSafeInteger(instance.localPort) && instance.localPort > 0 ? instance.localPort : null;
+  const loopbackURL = isLoopbackHealthURL(instance.healthURL) ? instance.healthURL : null;
+  if (port !== null) return `127.0.0.1:${port}`;
+  if (loopbackURL) return loopbackURL;
+  return '-';
+}
+
+export function formatInstanceStateBadge(instance) {
+  const state = instance?.state || 'unobserved';
+  let label = '未观测';
+  let badgeClass = 'badge badge-unknown';
+
+  switch (state) {
+    case 'running':
+      label = instance?.managed === true ? '运行中' : '运行中(未接管)';
+      badgeClass = 'badge badge-running';
+      break;
+    case 'stopped':
+      label = '已停止';
+      badgeClass = 'badge badge-stopped';
+      break;
+    case 'starting':
+      label = '启动中';
+      badgeClass = 'badge badge-warning';
+      break;
+    case 'stopping':
+      label = '停止中';
+      badgeClass = 'badge badge-warning';
+      break;
+    case 'restarting':
+      label = '重启中';
+      badgeClass = 'badge badge-warning';
+      break;
+    case 'failed':
+      label = '启动失败';
+      badgeClass = 'badge badge-danger';
+      break;
+    case 'unmanaged':
+      label = '未接管';
+      badgeClass = 'badge badge-warning';
+      break;
+    case 'unobserved':
+    default:
+      label = '未观测';
+      badgeClass = 'badge badge-unknown';
+      break;
+  }
+
+  const titleParts = [];
+  if (instance?.reasonCode) {
+    const desc = TUNNEL_CLIENT_REASON_LABELS[instance.reasonCode] || instance.reasonCode;
+    titleParts.push(`原因: ${desc}`);
+  }
+  if (instance?.lastExitCode !== null && instance?.lastExitCode !== undefined) {
+    titleParts.push(`退出码: ${instance.lastExitCode}`);
+  }
+  if (instance?.observedAt) titleParts.push(`观测时间: ${instance.observedAt}`);
+  const titleAttr = titleParts.length > 0 ? ` title="${escapeHtml(titleParts.join(' | '))}"` : '';
+
+  return `<span class="${badgeClass}"${titleAttr}>${escapeHtml(label)}</span>`;
+}
+
+export function formatInstanceAccount(instance) {
+  if (!instance || typeof instance !== 'object') return '-';
+  const profileId = instance.profileId ? String(instance.profileId) : '';
+  const profileLabel = instance.profileLabel ? String(instance.profileLabel) : '';
+  if (profileLabel && profileId) return `${profileLabel} (${profileId})`;
+  return profileLabel || profileId || '-';
+}
+
+// Per-row button gating, mirroring the existing start/restart/stop card rules.
+export function getInstanceActionGating(mcp, instance, eligibleProfiles = null) {
+  const serviceEnabled = mcp?.enabled !== false;
+  const state = instance?.state || 'unobserved';
+  const inTransition = isInstanceInTransition(instance);
+  // Only an explicitly unmanaged (external) process blocks control actions.
+  const isUnmanaged = state === 'unmanaged';
+  const eligible = Array.isArray(eligibleProfiles)
+    ? eligibleProfiles
+    : getEligibleProfilesForService(mcp?.id);
+  const noEligible = eligible.length === 0;
+  const rowKey = buildInstanceRowKey(mcp?.id, instance?.profileId);
+  const localPending = appState.instanceActionPending.get(rowKey) || null;
+  const carrierConfirmation = appState.instanceCarrierConfirmations.get(rowKey) || null;
+
+  // Reasons that block START and RESTART (anything may still be stopped).
+  const startBlock = (() => {
+    if (!serviceEnabled) return '服务已禁用';
+    if (inTransition) return `操作正在进行中 (${state})`;
+    if (localPending) return `该实例操作进行中 (${localPending})`;
+    if (isUnmanaged) return '检测到外部运行的隧道客户端（未接管），不可通过控制台操作';
+    if (noEligible) return '未找到包含该服务凭证的可用账号';
+    return null;
+  })();
+
+  // Reasons that block STOP (stop never depends on profile eligibility: a
+  // running instance must always remain stoppable).
+  const stopBlock = (() => {
+    if (inTransition) return `操作正在进行中 (${state})`;
+    if (localPending) return `该实例操作进行中 (${localPending})`;
+    if (isUnmanaged) return '检测到外部运行的隧道客户端（未接管），不可通过控制台操作';
+    return null;
+  })();
+
+  const running = state === 'running';
+  const stopped = state === 'stopped';
+
+  const start = { disabled: false, title: '' };
+  if (startBlock) {
+    start.disabled = true;
+    start.title = startBlock;
+  } else if (running) {
+    start.disabled = true;
+    start.title = '该账号实例已在运行中（如需重载请使用重启）';
+  }
+
+  const restart = { disabled: false, title: '' };
+  if (startBlock) {
+    restart.disabled = true;
+    restart.title = startBlock;
+  } else if (!running || instance?.owned !== true) {
+    restart.disabled = true;
+    restart.title = '该账号实例未处于受管运行状态，请直接启动';
+  }
+
+  const stop = { disabled: false, title: '' };
+  if (stopBlock) {
+    stop.disabled = true;
+    stop.title = stopBlock;
+  } else if (stopped) {
+    stop.disabled = true;
+    stop.title = '该账号实例已处于停止状态';
+  } else if (!running || instance?.owned !== true) {
+    stop.disabled = true;
+    stop.title = '该账号实例未处于受管运行状态';
+  }
+
+  return { start, stop, restart, confirmationPending: Boolean(carrierConfirmation) };
+}
+
+export function renderMcpInstanceSection(mcp) {
+  const instances = getMcpInstances(mcp);
+  const instanceCount = instances.length;
+  const runningCount = countRunningInstances(instances);
+  const expanded = shouldExpandInstanceSection(mcp.id, instances);
+  const eligibleProfiles = getEligibleProfilesForService(mcp.id);
+
+  const header = `
+    <button type="button" class="instance-section-toggle" data-action="toggle-instances" data-id="${escapeHtml(mcp.id)}"
+            aria-expanded="${expanded ? 'true' : 'false'}">
+      <span class="instance-section-caret" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+      <span class="instance-section-title">多账号实例 (${instanceCount})</span>
+      ${runningCount > 0 ? `<span class="badge badge-running">运行中 ${runningCount}</span>` : ''}
+    </button>
+  `;
+
+  if (instanceCount === 0) {
+    return `
+      <div class="instance-section${expanded ? ' instance-section-expanded' : ''}">
+        ${header}
+        <div class="instance-list${expanded ? '' : ' hidden'}">
+          <div class="instance-empty">该服务暂无并发账号实例记录。</div>
+        </div>
+      </div>
+    `;
+  }
+
+  const rows = instances.map(instance => {
+    const gating = getInstanceActionGating(mcp, instance, eligibleProfiles);
+    const profileLabel = escapeHtml(instance.profileLabel || instance.profileId || '-');
+    const profileId = escapeHtml(instance.profileId || '-');
+    const pid = Number.isSafeInteger(instance.pid) && instance.pid > 0 ? String(instance.pid) : '-';
+    // already masked server-side: rendered verbatim, never unmasked
+    const maskedTunnel = instance.maskedTunnelId ? escapeHtml(instance.maskedTunnelId) : '-';
+    const endpoint = escapeHtml(formatInstanceEndpoint(instance));
+    const startedAt = instance.startedAt ? escapeHtml(String(instance.startedAt)) : '-';
+    const btn = (action, label, cls, gate) => `
+      <button type="button" class="btn btn-sm ${cls} instance-action-btn"
+              data-action="${action}"
+              data-id="${escapeHtml(mcp.id)}"
+              data-profile-id="${profileId}"
+              ${gate.disabled ? `disabled title="${escapeHtml(gate.title)}"` : `title="${escapeHtml(label)}该账号实例"`}>
+        ${escapeHtml(label)}
+      </button>`;
+
+    const carrierBanner = gating.confirmationPending
+      ? `<div class="instance-confirm-banner" role="alert">
+           <span class="instance-confirm-text">该服务承载控制平面 (Carrier) 连接，需确认后方可停止或重启。</span>
+           <button type="button" class="btn btn-sm btn-warning" data-action="cancel-carrier"
+                   data-id="${escapeHtml(mcp.id)}" data-profile-id="${profileId}">取消确认</button>
+         </div>`
+      : '';
+
+    return `
+      <div class="instance-row" data-instance-key="${escapeHtml(buildInstanceRowKey(mcp.id, instance.profileId))}">
+        <div class="instance-account" title="运行账号">
+          <span class="instance-account-label">${profileLabel}</span>
+          <span class="instance-account-id font-mono">${profileId}</span>
+        </div>
+        <div class="instance-state">${formatInstanceStateBadge(instance)}</div>
+        <div class="instance-meta">
+          <span class="instance-meta-item" title="进程 PID">PID: <span class="font-mono">${escapeHtml(pid)}</span></span>
+          <span class="instance-meta-item" title="隧道 ID（服务端已脱敏）">隧道: <span class="font-mono">${maskedTunnel}</span></span>
+          <span class="instance-meta-item" title="本地端口 / 回环健康地址">端口: <span class="font-mono">${endpoint}</span></span>
+          <span class="instance-meta-item" title="启动时间">启动: <span class="font-mono">${startedAt}</span></span>
+        </div>
+        <div class="instance-actions">
+          ${btn('start', '启动', 'btn-primary', gating.start)}
+          ${btn('stop', '停止', 'btn-danger', gating.stop)}
+          ${btn('restart', '重启', 'btn-secondary', gating.restart)}
+        </div>
+        ${carrierBanner}
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="instance-section${expanded ? ' instance-section-expanded' : ''}">
+      ${header}
+      <div class="instance-list${expanded ? '' : ' hidden'}">
+        ${rows}
+        <div class="instance-hint">每个账号可独立启动一个隧道实例；启动 / 停止 / 重启仅影响该账号实例，不会影响其他账号。</div>
+      </div>
+    </div>
+  `;
+}
+
+// Drop timers whose owning MCP service no longer exists (stale after re-render).
+export function clearStaleInstancePollTimers() {
+  const knownServiceIds = new Set(appState.mcps.map(mcp => mcp.id));
+  for (const [rowKey, entry] of appState.instancePollTimers) {
+    if (!knownServiceIds.has(entry?.serviceId)) {
+      if (entry?.timer) clearInterval(entry.timer);
+      if (entry?.timeoutTimer) clearTimeout(entry.timeoutTimer);
+      appState.instancePollTimers.delete(rowKey);
+    }
+  }
+  for (const map of [appState.instanceActionPending, appState.instanceCarrierConfirmations]) {
+    for (const rowKey of [...map.keys()]) {
+      const serviceId = String(rowKey).split('::')[0];
+      if (!knownServiceIds.has(serviceId)) map.delete(rowKey);
+    }
+  }
+}
+
+export function clearInstancePollTimer(serviceId, profileId) {
+  const rowKey = buildInstanceRowKey(serviceId, profileId);
+  const entry = appState.instancePollTimers.get(rowKey);
+  if (entry) {
+    if (entry.timer) clearInterval(entry.timer);
+    if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+    appState.instancePollTimers.delete(rowKey);
+  }
+}
+
+export function clearAllInstancePollTimers() {
+  for (const entry of appState.instancePollTimers.values()) {
+    if (entry?.timer) clearInterval(entry.timer);
+    if (entry?.timeoutTimer) clearTimeout(entry.timeoutTimer);
+  }
+  appState.instancePollTimers.clear();
+  appState.instanceActionPending.clear();
+  appState.instanceCarrierConfirmations.clear();
+}
+
+// PATCH the live MCP state with an authoritative instance list from the server.
+export function applyInstanceSnapshot(serviceId, instances) {
+  const mcp = appState.mcps.find(item => item.id === serviceId);
+  if (!mcp) return null;
+  if (!mcp.runtime || typeof mcp.runtime !== 'object') mcp.runtime = {};
+  mcp.runtime.instances = Array.isArray(instances) ? instances : [];
+  return mcp;
+}
+
+export async function fetchMcpInstances(serviceId) {
+  const data = await apiRequest(`/api/mcps/${encodeURIComponent(serviceId)}/instances`);
+  const instances = Array.isArray(data?.instances) ? data.instances : [];
+  applyInstanceSnapshot(serviceId, instances);
+  return instances;
+}
+
+export function isInstanceSettled(instance, action) {
+  if (!instance) return false;
+  if (isInstanceInTransition(instance)) return false;
+  const state = instance.state || 'unobserved';
+  if (action === 'stop') return state === 'stopped' || state === 'failed' || state === 'unobserved';
+  return state === 'running' || state === 'failed' || state === 'unmanaged';
+}
+
+// Polls GET /api/mcps/:id/instances (~1s, ~30s cap) until the acted-on row settles,
+// then re-renders and refreshes dashboard data. Timers live in appState so they can
+// be cleared on modal close / logout / navigation.
+export function startInstanceActionPolling(serviceId, profileId, action) {
+  const rowKey = buildInstanceRowKey(serviceId, profileId);
+  clearInstancePollTimer(serviceId, profileId);
+
+  const entry = { serviceId, profileId, action, timer: null, timeoutTimer: null, done: false };
+  appState.instancePollTimers.set(rowKey, entry);
+
+  const finish = () => {
+    if (entry.done) return;
+    entry.done = true;
+    if (entry.timer) clearInterval(entry.timer);
+    if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+    entry.timer = null;
+    entry.timeoutTimer = null;
+    appState.instancePollTimers.delete(rowKey);
+    appState.instanceActionPending.delete(rowKey);
+  };
+
+  const poll = async () => {
+    if (entry.done) return;
+    try {
+      const instances = await fetchMcpInstances(serviceId);
+      const row = instances.find(item => String(item?.profileId) === String(profileId)) || null;
+      renderMcpsRegistryGrid();
+      if (isInstanceSettled(row, action)) {
+        finish();
+        const actionWord = action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启';
+        const failed = row?.state === 'failed';
+        if (failed) {
+          showAlert('warning', '实例操作未完成', `账号 "${profileId}" 的实例${actionWord}未成功，请查看状态与原因码。`);
+        } else {
+          showAlert('success', '操作成功', `账号 "${profileId}" 的实例${actionWord}已完成。`);
+        }
+        await loadDashboardData();
+      }
+    } catch (pollErr) {
+      console.warn('Instance polling warning:', pollErr);
+    }
+  };
+
+  entry.timer = setInterval(poll, 1000);
+  entry.timeoutTimer = setTimeout(() => {
+    if (entry.done) return;
+    finish();
+    showAlert('warning', '等待超时', `账号 "${profileId}" 的实例状态在 30 秒内未稳定，请手动刷新确认。`);
+  }, 30000);
+
+  poll();
+}
+
+export async function handleInstanceAction(serviceId, profileId, action, options = {}) {
+  const mcp = appState.mcps.find(item => item.id === serviceId);
+  if (!mcp || !profileId || !['start', 'stop', 'restart'].includes(action)) return;
+  const rowKey = buildInstanceRowKey(serviceId, profileId);
+  const actionWord = action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启';
+
+  // A pending carrier confirmation is bound to one (action, idempotencyKey) pair.
+  // Only reuse it when the user is re-confirming the SAME action on the SAME row.
+  const pendingConfirmation = appState.instanceCarrierConfirmations.get(rowKey) || null;
+  const reusableConfirmation = pendingConfirmation && pendingConfirmation.action === action
+    ? pendingConfirmation
+    : null;
+  if (pendingConfirmation && !reusableConfirmation) {
+    appState.instanceCarrierConfirmations.delete(rowKey);
+  }
+
+  const idempotencyKey = reusableConfirmation?.idempotencyKey || generateIdempotencyKey();
+  const carrierToken = reusableConfirmation?.carrierToken || null;
+
+  appState.instanceActionPending.set(rowKey, action);
+  renderMcpsRegistryGrid();
+
+  const body = {
+    expectedRevision: appState.revision,
+    profileId
+  };
+  if (carrierToken) body.carrierToken = carrierToken;
+
+  try {
+    const response = await apiRequest(
+      `/api/mcps/${encodeURIComponent(serviceId)}/instances/${encodeURIComponent(profileId)}/${action}`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body
+      }
+    );
+
+    appState.instanceCarrierConfirmations.delete(rowKey);
+
+    // Fast no-op paths: informational toast only, nothing was changed.
+    const decision = response?.decision || response?.code;
+    if (decision === 'noop' || response?.code === 'ALREADY_RUNNING' || response?.code === 'ALREADY_STOPPED') {
+      appState.instanceActionPending.delete(rowKey);
+      const code = response?.code || (action === 'stop' ? 'ALREADY_STOPPED' : 'ALREADY_RUNNING');
+      const localized = SAFE_ERROR_MESSAGES[code] || (action === 'stop' ? '该实例已处于停止状态。' : '该实例已在运行中。');
+      showAlert('info', '无需操作', `账号 "${profileId}"：${localized}`);
+      try {
+        await fetchMcpInstances(serviceId);
+      } catch (refreshErr) {
+        console.warn('Instance refresh warning:', refreshErr);
+      }
+      renderMcpsRegistryGrid();
+      return;
+    }
+
+    const op = response?.operation || response;
+    const opId = op?.id || op?.operationId || null;
+    showAlert('info', `已提交${actionWord}请求`,
+      `账号 "${profileId}" 的实例${actionWord}已提交${opId ? ` (操作: ${opId})` : ''}，正在等待状态确认...`);
+    startInstanceActionPolling(serviceId, profileId, action);
+  } catch (err) {
+    const isCarrierRequired = err.status === 409 && (
+      err.data?.error === 'CARRIER_CONFIRMATION_REQUIRED' ||
+      err.data?.code === 'CARRIER_CONFIRMATION_REQUIRED' ||
+      (err.data?.decision === 'reject' && err.data?.code === 'CARRIER_CONFIRMATION_REQUIRED')
+    );
+    if (isCarrierRequired && err.data?.carrierToken && !carrierToken) {
+      // Same contract as handleExecuteTunnelAction: the 409 carries a carrierToken and
+      // the user must confirm once. Retain BOTH the token and the idempotency key so the
+      // next click on this row re-submits with a signature the server will accept.
+      appState.instanceCarrierConfirmations.set(rowKey, { carrierToken: err.data.carrierToken, idempotencyKey, action });
+      appState.instanceActionPending.delete(rowKey);
+      showAlert('warning', '需要控制平面承载确认',
+        `当前服务承载控制平面 (Carrier) 连接。请再次点击该账号所在行的“${actionWord}”按钮完成确认。`);
+      renderMcpsRegistryGrid();
+      return;
+    }
+
+    if (isCarrierRequired && carrierToken) {
+      // Token no longer verifies (e.g. context drifted): drop it and ask for a fresh one.
+      appState.instanceCarrierConfirmations.delete(rowKey);
+    }
+
+    appState.instanceActionPending.delete(rowKey);
+    const parsed = formatSafeError(err);
+    showAlert('error', '实例操作失败', parsed.displayText);
+    renderMcpsRegistryGrid();
+  }
+}
+
+export function cancelInstanceCarrierConfirmation(serviceId, profileId) {
+  appState.instanceCarrierConfirmations.delete(buildInstanceRowKey(serviceId, profileId));
+  renderMcpsRegistryGrid();
+}
+
 export function renderMcpsRegistryGrid() {
   if (!dom.mcpsContainer) return;
+  clearStaleInstancePollTimers();
   dom.mcpsContainer.innerHTML = '';
 
   if (appState.mcps.length === 0) {
@@ -2024,6 +2543,8 @@ export function renderMcpsRegistryGrid() {
         </div>
       </div>
 
+      ${renderMcpInstanceSection(mcp)}
+
       <div class="mcp-card-footer">
         <button type="button" class="btn btn-secondary btn-sm btn-mcp-locations" data-id="${escapeHtml(mcp.id)}">
           查看路径与详情
@@ -2053,6 +2574,24 @@ export function renderMcpsRegistryGrid() {
     card.querySelector('.btn-mcp-restart')?.addEventListener('click', () => openTunnelActionModal(mcp, 'restart'));
     card.querySelector('.btn-mcp-stop')?.addEventListener('click', () => openTunnelActionModal(mcp, 'stop'));
     card.querySelector('.btn-mcp-delete')?.addEventListener('click', () => openLifecycleModal(mcp, 'delete'));
+
+    // Bind per-account instance section actions (additive; card buttons untouched)
+    card.querySelector('[data-action="toggle-instances"]')?.addEventListener('click', () => toggleInstanceSection(mcp.id));
+    card.querySelectorAll('.instance-action-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const profileId = btn.dataset.profileId;
+        const action = btn.dataset.action;
+        if (!profileId || !action) return;
+        handleInstanceAction(mcp.id, profileId, action);
+      });
+    });
+    card.querySelectorAll('[data-action="cancel-carrier"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const profileId = btn.dataset.profileId;
+        if (!profileId) return;
+        cancelInstanceCarrierConfirmation(mcp.id, profileId);
+      });
+    });
 
     dom.mcpsContainer.appendChild(card);
   });
@@ -2594,7 +3133,6 @@ export function closeLifecycleModal() {
   appState.selectedLifecycleMcp = null;
   dom.mcpLifecycleModal?.classList.add('hidden');
 }
-
 export async function handleExecuteStopMcp() {
   const mcp = appState.selectedLifecycleMcp;
   if (!mcp) return;
@@ -2672,7 +3210,10 @@ export function startStopPolling(operationId, mcp) {
           }
         } else {
           if (dom.lifecycleError) {
-            dom.lifecycleError.textContent = `[REJECTED] 停止操作被拒绝: ${op.failureCode || 'REJECTED'}`;
+            // Registry lifecycle actions expose the reason as errorCode/error_code; the legacy
+            // failureCode field only exists on switch operations. Reading just failureCode hid
+            // every real cause behind a bare "REJECTED".
+            dom.lifecycleError.textContent = `[REJECTED] 停止操作被拒绝: ${op.errorCode || op.error_code || op.failureCode || op.error || 'REJECTED'}`;
             dom.lifecycleError.classList.remove('hidden');
           }
         }
@@ -2806,6 +3347,7 @@ export function closeTunnelActionModal() {
   appState.tunnelActionIdempotencyKey = null;
   dom.tunnelActionModal?.classList.add('hidden');
 }
+
 
 export async function handleExecuteTunnelAction() {
   const mcp = appState.selectedTunnelActionMcp;
@@ -2950,7 +3492,10 @@ export function startTunnelActionPolling(operationId, mcp, action) {
           await loadDashboardData();
         } else {
           if (dom.tunnelActionError) {
-            dom.tunnelActionError.textContent = `[REJECTED] 操作被拒绝: ${op.failureCode || op.error || 'REJECTED'}`;
+            // Registry lifecycle actions expose the reason as errorCode/error_code; the legacy
+            // failureCode field only exists on switch operations. Reading just failureCode hid
+            // every real cause behind a bare "REJECTED".
+            dom.tunnelActionError.textContent = `[REJECTED] 操作被拒绝: ${op.errorCode || op.error_code || op.failureCode || op.error || 'REJECTED'}`;
             dom.tunnelActionError.classList.remove('hidden');
           }
           dom.tunnelActionProgress?.classList.add('hidden');

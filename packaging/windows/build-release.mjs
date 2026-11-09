@@ -6,8 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { auditTree, forbiddenPayload } from './audit-release.mjs';
 
 const toolsRoot = path.dirname(fileURLToPath(import.meta.url));
-const releaseId = '20261109-rc21-r1';
-const sourceSnapshot = 'release-candidate-21-20261109';
+const releaseId = '20261109-rc22-r1';
+const sourceSnapshot = 'release-candidate-22-20261109';
 const allowedArguments = new Set(['--source', '--output', '--runtime', '--node-license', '--dependency-kit']);
 const args = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {

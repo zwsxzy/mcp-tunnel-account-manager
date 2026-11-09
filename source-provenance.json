@@ -1,8 +1,8 @@
 {
-  "releaseId": "20261109-rc21-r1",
-  "releaseTag": "v1.2.0-preview.4",
+  "releaseId": "20261109-rc22-r1",
+  "releaseTag": "v1.2.0-preview.5",
   "inputManifestStatus": "verified-clean",
-  "checkedFiles": 35,
+  "checkedFiles": 39,
   "features": [
     "safe-switching-mask-protection",
     "vault-credential-self-healing",
@@ -12,12 +12,16 @@
     "parallel-health-and-status-probe",
     "real-pid-observation-only",
     "windows-inherited-console-hidden",
-    "audited-native-launch-identity"
+    "audited-native-launch-identity",
+    "http-transport-restored-tag-recovery",
+    "lifecycle-rejection-reason-surfacing",
+    "removal-runtime-state-resolution"
   ],
   "policy": "Enforce strict credential preservation against masked tunnel IDs, verify only against live observed identities, and maintain isolated deployment tooling.",
   "mergedFrom": [
     "main@329451d",
-    "new@1f27aa4"
+    "new@1f27aa4",
+    "feature/concurrent-account-tunnels"
   ],
-  "notes": "Core source hashes were recomputed against the merged tree. The previous RC19/RC20 baselines no longer apply; a build from this tree must carry the rc21 identity."
+  "notes": "Core source hashes were recomputed against the merged tree. The RC19/RC20/RC21 baselines no longer apply; a build from this tree must carry the rc22 identity."
 }
