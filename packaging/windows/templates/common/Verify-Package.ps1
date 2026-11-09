@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 param([string]$Root = $PSScriptRoot, [switch]$AllowGeneratedProfiles)
 $ErrorActionPreference = 'Stop'
 try {
@@ -25,7 +25,7 @@ try {
         if ($taskItem.PSIsContainer) { continue }
         $taskRelative = $taskItem.FullName.Substring($taskRoot.Length + 1)
         if ($taskRelative -eq 'FILES.sha256') { continue }
-        if ($AllowGeneratedProfiles -and $taskRelative.StartsWith('generated-profiles\',[StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($AllowGeneratedProfiles -and ($taskRelative.StartsWith('generated-profiles\',[StringComparison]::OrdinalIgnoreCase) -or $taskRelative -like '*\__pycache__\*' -or $taskRelative.EndsWith('.pyc',[StringComparison]::OrdinalIgnoreCase))) { continue }
         if (-not $taskExpected.ContainsKey($taskRelative)) { throw ('UNEXPECTED_FILE: ' + $taskRelative) }
     }
     Write-Host ('SHA256 verification passed: ' + $taskExpected.Count + ' files.')
