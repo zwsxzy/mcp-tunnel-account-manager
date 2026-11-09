@@ -2,6 +2,7 @@ import path from 'node:path';
 import { executeOperation } from './core/switch-core.mjs';
 import { acquireDaemonLock } from './core/daemon-lock.mjs';
 import { runMcpLifecycleAction, runMcpStopAction } from './core/mcp-lifecycle.mjs';
+import { runInstanceLifecycleAction } from './core/instance-lifecycle.mjs';
 import {
   loadWorkRecord,
   withStartupRollback,
@@ -10,7 +11,7 @@ import {
 import { classifyQueuedWork, missingReferenceDisposition } from './core/work-item-routing.mjs';
 import * as adaptersModule from './adapters/index.mjs';
 
-export function createRunner({ repo, adapters, adapterProvider, dataDir, vault }) {
+export function createRunner({ repo, adapters, adapterProvider, instanceAdapterProvider, dataDir, vault }) {
   if (!repo || typeof repo !== 'object') {
     throw new TypeError('A valid repo object is required to create a runner');
   }
@@ -87,6 +88,30 @@ export function createRunner({ repo, adapters, adapterProvider, dataDir, vault }
     withExclusiveLock,
     vault
   };
+
+  /**
+   * Provider for CONCURRENT PROFILE INSTANCES, kept strictly separate from the
+   * legacy service-level provider. An instance action must never be served by a
+   * legacy `ServiceAdapter`: that adapter has no `instanceId` and its configPath
+   * points at the production `%APPDATA%\tunnel-client\<service>.yaml`.
+   *
+   * Returns null when no instance provider is available, which makes the
+   * instance lifecycle reject with a safe code instead of mutating anything.
+   */
+  let resolvedInstanceAdapterProvider = instanceAdapterProvider || null;
+  if (!resolvedInstanceAdapterProvider &&
+      typeof adaptersModule.createInstanceAdapterProvider === 'function') {
+    try {
+      resolvedInstanceAdapterProvider = adaptersModule.createInstanceAdapterProvider({
+        dataDir: resolvedDataDir,
+        vault
+      });
+    } catch (_) {
+      // Production data dirs are refused by the instance adapter's isolation
+      // guard; run without an instance provider rather than risking a write.
+      resolvedInstanceAdapterProvider = null;
+    }
+  }
 
   async function fetchWorkQueue() {
     if (typeof repo.getWorkQueue === 'function') {
@@ -166,14 +191,44 @@ export function createRunner({ repo, adapters, adapterProvider, dataDir, vault }
     currentOperationId = id;
     try {
       if (workKind === 'lifecycle') {
-        await withExclusiveLock(async () => {
-          await runMcpLifecycleAction({
-            repo,
-            adapterProvider: resolvedAdapterProvider,
-            actionId: id,
-            vault
+        // A lifecycle action that carries a composite instanceId targets ONE
+        // concurrent profile instance, not the whole service: it must go through
+        // the instance policy so a running sibling profile never blocks it.
+        // Legacy whole-service actions carry no instanceId and keep the exact
+        // pre-existing path below.
+        let instanceAction = null;
+        try {
+          instanceAction = typeof repo.loadAction === 'function'
+            ? await repo.loadAction(id)
+            : (typeof repo.registry?.loadAction === 'function' ? await repo.registry.loadAction(id) : null);
+        } catch (_) {
+          instanceAction = null;
+        }
+        const instanceScoped = instanceAction != null &&
+          typeof (instanceAction.instanceId || instanceAction.instance_id) === 'string' &&
+          Boolean(instanceAction.instanceId || instanceAction.instance_id);
+
+        if (instanceScoped) {
+          await withExclusiveLock(async () => {
+            await runInstanceLifecycleAction({
+              repo,
+              // Deliberately NOT resolvedAdapterProvider: a legacy service
+              // adapter must never be driven by an instance action.
+              adapterProvider: resolvedInstanceAdapterProvider,
+              actionId: id,
+              vault
+            });
           });
-        });
+        } else {
+          await withExclusiveLock(async () => {
+            await runMcpLifecycleAction({
+              repo,
+              adapterProvider: resolvedAdapterProvider,
+              actionId: id,
+              vault
+            });
+          });
+        }
       } else if (workKind === 'switch') {
         await executeOperation(id, deps);
       }

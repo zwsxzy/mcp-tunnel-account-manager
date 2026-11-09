@@ -18,6 +18,7 @@ import {
   isReservedServiceEnvName,
   isRecord
 } from './adapters/mcp-binding.mjs';
+import { buildInstanceId } from './core/concurrent-instances.mjs';
 
 export class RegistryStoreError extends Error {
   constructor(message, status = 400, code = 'REGISTRY_ERROR') {
@@ -335,12 +336,20 @@ function formatPublicAction(row, extra = null) {
   const kind = extra?.action || extra?.kind || row.kind || 'stop';
   const profileId = extra?.profileId !== undefined ? extra.profileId : (row.profileId || null);
   const state = extra?.state || row.state;
+  // Instance scope is additive: `null` for every legacy whole-service action, so
+  // existing consumers that ignore it are unaffected. The `mcp_actions.instance_id`
+  // column wins over any sealed-payload copy, so a payload that predates the
+  // column can never fabricate a scope. Exposed under both names because the
+  // runner/HTTP layers read either `instanceId` or `instance_id`.
+  const instanceId = row.instance_id || extra?.instanceId || null;
   return {
     operationId: row.id,
     id: row.id,
     kind,
     action: kind,
     profileId,
+    instanceId,
+    instance_id: instanceId,
     serviceId: row.service_id,
     state,
     status: state,
@@ -359,14 +368,20 @@ function computeStopFingerprint(serviceId, expectedRevision) {
   return createHash('sha256').update(norm).digest('hex');
 }
 
-function computeLifecycleActionFingerprint(action, serviceId, profileId, expectedRevision) {
-  const norm = JSON.stringify({
+function computeLifecycleActionFingerprint(action, serviceId, profileId, expectedRevision, instanceId = null) {
+  const norm = {
     action: String(action),
     serviceId: String(serviceId),
     profileId: profileId ? String(profileId) : null,
     expectedRevision: expectedRevision !== undefined && expectedRevision !== null ? Number(expectedRevision) : null
-  });
-  return createHash('sha256').update(norm).digest('hex');
+  };
+  // Additive + backward compatible: the key is only added when an instance is
+  // addressed, so fingerprints persisted by previous releases stay byte-identical
+  // and in-flight idempotency keys keep replaying instead of colliding.
+  // It IS present for instance actions, so two profiles of one service cannot
+  // reuse one idempotency key.
+  if (instanceId) norm.instanceId = String(instanceId);
+  return createHash('sha256').update(JSON.stringify(norm)).digest('hex');
 }
 
 export function attachRegistry({
@@ -432,6 +447,19 @@ export function attachRegistry({
     INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_gated', '0');
     INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_reason', '');
   `);
+
+  // Additive migrations for existing databases (must be no-ops on fresh DBs).
+  // `instance_id` scopes a lifecycle action to ONE concurrent profile instance;
+  // NULL keeps the legacy whole-service semantics byte-identical.
+  try {
+    db.exec('ALTER TABLE mcp_actions ADD COLUMN instance_id TEXT;');
+  } catch (_) {}
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_mcp_actions_service_instance
+        ON mcp_actions (service_id, instance_id);
+    `);
+  } catch (_) {}
 
   // Initial legacy seeding: only seed if absent and never tombstoned
   const now = new Date().toISOString();
@@ -989,7 +1017,17 @@ export function attachRegistry({
       );
 
       const rt = fetchServiceRuntime(id);
-      const runtimeState = rt?.state || 'unknown';
+      // The runtime DTO does not carry a top-level `state`: the store returns
+      // {runtimeState, activeProfileId, instances}, and only formatRuntime() derives
+      // `state`. Reading rt?.state alone therefore produced 'unknown' for every service,
+      // so removal always failed with RUNTIME_STATE_UNKNOWN and nothing could be deleted.
+      // Prefer the tunnelClient observation (same source the service card and the frontend
+      // canDeleteMcp() use), then the legacy runtimeState field.
+      const runtimeState =
+        rt?.tunnelClient?.state ||
+        rt?.state ||
+        rt?.runtimeState ||
+        'unknown';
 
       let busy = false;
       if (typeof assertIdle === 'function') {
@@ -1085,7 +1123,23 @@ export function attachRegistry({
   }
 
   // Lifecycle Actions (start, stop, restart)
-  async function createLifecycleAction({ action = 'stop', serviceId, profileId = null, expectedRevision, idempotencyKey, carrierToken = null, sessionBinding = null } = {}) {
+  //
+  // `instanceId` is OPTIONAL and additive (see
+  // docs/analysis/concurrent-instances-contract.md §2.3):
+  //   absent  -> legacy whole-service behaviour, byte-identical to before.
+  //   present -> must equal buildInstanceId(serviceId, profileId), else
+  //              INVALID_INSTANCE; the action then targets ONLY that instance and
+  //              `stop` keeps its profileId so the right process is stopped.
+  async function createLifecycleAction({
+    action = 'stop',
+    serviceId,
+    profileId = null,
+    instanceId = null,
+    expectedRevision,
+    idempotencyKey,
+    carrierToken = null,
+    sessionBinding = null
+  } = {}) {
     if (!isMcpServiceId(serviceId)) {
       throw new RegistryStoreError(`Invalid service ID '${serviceId}'`, 400, 'INVALID_MCP_ID');
     }
@@ -1093,7 +1147,40 @@ export function attachRegistry({
       throw new RegistryStoreError(`Invalid lifecycle action '${action}'`, 400, 'INVALID_ACTION');
     }
 
-    const fingerprint = computeLifecycleActionFingerprint(action, serviceId, profileId, expectedRevision);
+    // Normalize the optional instance scope up front. An empty string is treated
+    // as absent so `instanceId: ''` from a DTO cannot create a bogus scope.
+    let resolvedInstanceId = null;
+    if (instanceId !== null && instanceId !== undefined) {
+      if (typeof instanceId !== 'string' || !instanceId) {
+        throw new RegistryStoreError(`Invalid instance id '${instanceId}'`, 400, 'INVALID_INSTANCE');
+      }
+      resolvedInstanceId = instanceId;
+      // The profile must be known NOW to verify the composite id; an instance
+      // action can never fall back to the active profile (that would let the
+      // caller target a different account than the one it named).
+      if (!profileId) {
+        throw new RegistryStoreError(
+          `Profile required to address instance '${resolvedInstanceId}'`,
+          400,
+          'PROFILE_REQUIRED'
+        );
+      }
+      let expectedInstanceId = null;
+      try {
+        expectedInstanceId = buildInstanceId(serviceId, profileId);
+      } catch (_) {
+        throw new RegistryStoreError(`Invalid instance id '${resolvedInstanceId}'`, 400, 'INVALID_INSTANCE');
+      }
+      if (expectedInstanceId !== resolvedInstanceId) {
+        throw new RegistryStoreError(
+          `instanceId '${resolvedInstanceId}' does not match service '${serviceId}' / profile '${profileId}'`,
+          400,
+          'INVALID_INSTANCE'
+        );
+      }
+    }
+
+    const fingerprint = computeLifecycleActionFingerprint(action, serviceId, profileId, expectedRevision, resolvedInstanceId);
 
     // 1. Initial idempotency check outside sync transaction
     if (idempotencyKey) {
@@ -1135,7 +1222,9 @@ export function attachRegistry({
     // Verify profile if start/restart
     let resolvedProfileId = profileId;
     if (action !== 'stop') {
-      if (!resolvedProfileId) {
+      // An instance-scoped action always names its profile already (validated
+      // above), so it must never fall back to the active-profile pointer.
+      if (!resolvedProfileId && !resolvedInstanceId) {
         const actRow = db.prepare('SELECT profile_id FROM active_profiles WHERE service_id = ?').get(serviceId);
         resolvedProfileId = actRow?.profile_id || null;
       }
@@ -1149,6 +1238,14 @@ export function attachRegistry({
       const creds = JSON.parse(profRow.sealed_credentials || '{}');
       if (!creds[serviceId]) {
         throw new RegistryStoreError(`Profile '${resolvedProfileId}' has no credentials for '${serviceId}'`, 409, 'PROFILE_NOT_CONFIGURED');
+      }
+    } else if (resolvedInstanceId) {
+      // Instance-scoped stop keeps its profileId so the right instance is
+      // targeted, and only requires the profile to exist (credentials are not
+      // needed just to stop a process, and may have been removed meanwhile).
+      const profRow = db.prepare('SELECT id FROM profiles WHERE id = ?').get(String(resolvedProfileId));
+      if (!profRow) {
+        throw new RegistryStoreError(`Profile '${resolvedProfileId}' not found`, 404, 'PROFILE_NOT_FOUND');
       }
     }
 
@@ -1165,13 +1262,15 @@ export function attachRegistry({
       kind: action,
       serviceId,
       profileId: resolvedProfileId,
+      instanceId: resolvedInstanceId,
       expectedRevision,
       carrierToken,
       carrierContext: serviceDef?.controlCarrier ? {
         sessionBinding,
         idempotencyKey,
         serviceRevision: serviceRow.revision,
-        profileId: resolvedProfileId
+        profileId: resolvedProfileId,
+        instanceId: resolvedInstanceId
       } : null,
       sessionBinding,
       idempotencyKey,
@@ -1214,14 +1313,15 @@ export function attachRegistry({
         db.prepare(`
           INSERT INTO mcp_actions (
             id, service_id, idempotency_key, request_fingerprint,
-            state, error_code, sealed_payload, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'QUEUED', NULL, ?, ?, ?)
+            state, error_code, sealed_payload, instance_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'QUEUED', NULL, ?, ?, ?, ?)
         `).run(
           actionId,
           serviceId,
           idempotencyKey || null,
           fingerprint,
           sealedPayloadText,
+          resolvedInstanceId,
           now,
           now
         );
@@ -1244,6 +1344,8 @@ export function attachRegistry({
         kind: action,
         action,
         profileId: resolvedProfileId,
+        instanceId: resolvedInstanceId,
+        instance_id: resolvedInstanceId,
         serviceId,
         state: 'QUEUED',
         status: 'QUEUED',
@@ -1254,13 +1356,13 @@ export function attachRegistry({
     });
   }
 
-  async function createStopAction({ serviceId, expectedRevision, idempotencyKey } = {}) {
-    return await createLifecycleAction({
-      action: 'stop',
-      serviceId,
-      expectedRevision,
-      idempotencyKey
-    });
+  async function createStopAction({ serviceId, profileId = null, instanceId = null, expectedRevision, idempotencyKey } = {}) {
+    // Legacy callers pass neither profileId nor instanceId: the action stays a
+    // whole-service stop whose payload profileId resolves to null, exactly as before.
+    const args = { action: 'stop', serviceId, expectedRevision, idempotencyKey };
+    if (profileId !== null && profileId !== undefined) args.profileId = profileId;
+    if (instanceId !== null && instanceId !== undefined) args.instanceId = instanceId;
+    return await createLifecycleAction(args);
   }
 
   function listPendingActionIds() {
@@ -1297,12 +1399,18 @@ export function attachRegistry({
       }
     }
     const kind = payload?.action || payload?.kind || 'stop';
+    // `instance_id` is the authoritative column (survives payload/seal changes);
+    // the sealed payload is only a fallback for rows written before the column
+    // existed. Both are surfaced so callers can read either spelling.
+    const instanceId = row.instance_id || payload?.instanceId || null;
     return {
       operationId: row.id,
       id: row.id,
       kind,
       action: kind,
       profileId: payload?.profileId || null,
+      instanceId,
+      instance_id: instanceId,
       serviceId: row.service_id,
       state: row.state,
       status: row.state,

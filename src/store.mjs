@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { attachRegistry } from './mcp-registry-store.mjs';
 import { safeFailureReason } from './core/switch-core.mjs';
 import { isMcpServiceId } from './core/mcp-registry-policy.mjs';
+import { buildInstanceId, parseInstanceId } from './core/concurrent-instances.mjs';
 
 export class StoreError extends Error {
   constructor(message, status = 500, code = 'STORE_ERROR') {
@@ -164,6 +165,31 @@ export function openStore(options = {}) {
       profile_revision INTEGER,
       service_revision INTEGER
     );
+
+    -- Additive: concurrent multi-profile tunnel instances.
+    -- active_profiles above stays the SINGLE-ACTIVE hot-switch pointer and is
+    -- never written from this table's lifecycle path.
+    CREATE TABLE IF NOT EXISTS instance_runtime (
+      instance_id      TEXT PRIMARY KEY,
+      service_id       TEXT NOT NULL,
+      profile_id       TEXT NOT NULL,
+      state            TEXT NOT NULL DEFAULT 'stopped',
+      pid              INTEGER,
+      started_at       TEXT,
+      executable_path  TEXT,
+      health_url       TEXT,
+      local_port       INTEGER,
+      profile_yaml_path TEXT,
+      operation_id     TEXT,
+      reason_code      TEXT,
+      last_exit_code   INTEGER,
+      observed_at      TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_instance_runtime_service_profile
+      ON instance_runtime(service_id, profile_id);
   `);
 
   // Ensure additive column migrations for existing databases
@@ -190,6 +216,9 @@ export function openStore(options = {}) {
         WHERE provenance_identity IS NOT NULL;
     `);
   } catch (_) {}
+  // Additive: `mcp_actions.instance_id` is created by attachRegistry() below
+  // (it owns the mcp_actions table). The column/index migration lives there so a
+  // direct attachRegistry() call also upgrades an existing DB in place.
 
   // Initialize metadata keys if absent
   db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES ('revision', '0')").run();
@@ -382,6 +411,314 @@ export function openStore(options = {}) {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Concurrent multi-profile instances (additive; see §2 of
+  // docs/analysis/concurrent-instances-contract.md).
+  //
+  // `active_profiles` stays the single-active hot-switch pointer and is NEVER
+  // written here. Per-instance truth lives only in `instance_runtime`.
+  // Everything returned from this section is redacted: tunnel ids are masked
+  // via profile.services_meta, never read from sealed credentials.
+  // ---------------------------------------------------------------------
+
+  const INSTANCE_COLUMN_MAP = {
+    instanceId: 'instance_id',
+    serviceId: 'service_id',
+    profileId: 'profile_id',
+    state: 'state',
+    pid: 'pid',
+    startedAt: 'started_at',
+    executablePath: 'executable_path',
+    healthURL: 'health_url',
+    localPort: 'local_port',
+    profileYamlPath: 'profile_yaml_path',
+    operationId: 'operation_id',
+    reasonCode: 'reason_code',
+    lastExitCode: 'last_exit_code',
+    observedAt: 'observed_at'
+  };
+
+  function positivePidOrNull(value) {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+
+  function positivePortOrNull(value) {
+    return Number.isSafeInteger(value) && value > 0 && value <= 65535 ? value : null;
+  }
+
+  function isoOrNull(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+    return null;
+  }
+
+  /** Safe profile id -> {label, maskedTunnelId} used to redact instance records. */
+  function buildInstanceProfileLookup() {
+    const lookup = new Map();
+    try {
+      const rows = db.prepare('SELECT id, label, services_meta FROM profiles').all();
+      for (const row of rows) {
+        let meta = {};
+        try {
+          meta = JSON.parse(row.services_meta || '{}');
+        } catch (_) {
+          meta = {};
+        }
+        lookup.set(row.id, { label: row.label || null, servicesMeta: meta });
+      }
+    } catch (_) {}
+    return lookup;
+  }
+
+  /**
+   * Maps one instance_runtime row to the public instance record.
+   * `maskedTunnelId` comes exclusively from the profile's services_meta mirror,
+   * so no sealed credential is ever unsealed (or leaked) on this path.
+   */
+  function formatInstanceRuntime(row, profileLookup) {
+    if (!row) return null;
+    const lookup = profileLookup || buildInstanceProfileLookup();
+    const profile = lookup.get(row.profile_id) || null;
+    const serviceMeta = profile && profile.servicesMeta ? profile.servicesMeta[row.service_id] : null;
+    return {
+      instanceId: row.instance_id,
+      serviceId: row.service_id,
+      profileId: row.profile_id,
+      profileLabel: profile ? profile.label : null,
+      state: row.state || 'stopped',
+      pid: positivePidOrNull(row.pid),
+      startedAt: row.started_at ?? null,
+      executablePath: row.executable_path ?? null,
+      healthURL: row.health_url ?? null,
+      localPort: positivePortOrNull(row.local_port),
+      profileYamlPath: row.profile_yaml_path ?? null,
+      operationId: row.operation_id ?? null,
+      reasonCode: row.reason_code ?? null,
+      lastExitCode: Number.isInteger(row.last_exit_code) ? row.last_exit_code : null,
+      observedAt: row.observed_at ?? null,
+      createdAt: row.created_at ?? null,
+      updatedAt: row.updated_at ?? null,
+      maskedTunnelId: serviceMeta ? (serviceMeta.maskedTunnelId ?? null) : null
+    };
+  }
+
+  function listInstanceRuntimes(serviceId) {
+    if (typeof serviceId !== 'string' || !serviceId) return [];
+    const rows = db.prepare(
+      'SELECT * FROM instance_runtime WHERE service_id = ? ORDER BY profile_id ASC, instance_id ASC'
+    ).all(serviceId);
+    const lookup = buildInstanceProfileLookup();
+    return rows.map(row => formatInstanceRuntime(row, lookup));
+  }
+
+  function getInstanceRuntime(instanceId) {
+    if (typeof instanceId !== 'string' || !instanceId) return null;
+    const row = db.prepare('SELECT * FROM instance_runtime WHERE instance_id = ?').get(instanceId);
+    if (!row) return null;
+    return formatInstanceRuntime(row);
+  }
+
+  /**
+   * Inserts or patches one instance runtime record.
+   *
+   * Patch semantics: only keys PRESENT on `patch` are written, so an existing
+   * row keeps untouched columns; an explicit `null` clears a column.
+   * `serviceId`/`profileId` are required when the row does not exist yet and are
+   * verified against `instanceId` (buildInstanceId) so the namespace cannot drift.
+   *
+   * @returns {object} the stored public instance record (never raw secrets)
+   */
+  function upsertInstanceRuntime(instanceId, patch = {}) {
+    if (typeof instanceId !== 'string' || !instanceId) {
+      throw new StoreError('instanceId is required', 400, 'INVALID_INSTANCE');
+    }
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new StoreError('Instance runtime patch must be an object', 400, 'INVALID_INSTANCE');
+    }
+
+    const existing = db.prepare('SELECT * FROM instance_runtime WHERE instance_id = ?').get(instanceId);
+
+    let serviceId = patch.serviceId !== undefined ? patch.serviceId : (existing?.service_id ?? null);
+    let profileId = patch.profileId !== undefined ? patch.profileId : (existing?.profile_id ?? null);
+
+    if (serviceId === null || serviceId === undefined || serviceId === '') {
+      const parsed = parseInstanceId(instanceId);
+      if (!parsed) throw new StoreError('Malformed instanceId', 400, 'INVALID_INSTANCE');
+      serviceId = parsed.serviceId;
+    }
+    /*
+     * IDENTITY IS IMMUTABLE.
+     *
+     * `sanitizeProfileSegment` folds many raw profile ids onto one segment
+     * ("Work Account" and "Work_Account" both become `Work_Account`), so the
+     * composite instanceId is NOT an injective encoding of the account identity.
+     * The canonical-id check below therefore cannot, by itself, prove that a
+     * patch addresses the same account as the stored row.
+     *
+     * Without this guard a patch carrying a DIFFERENT colliding profileId would
+     * silently rebind the row through the UPDATE branch and strand the original
+     * account's live pid (an orphaned tunnel-client). Refuse loudly instead.
+     */
+    if (existing) {
+      const storedService = String(existing.service_id);
+      const storedProfile = String(existing.profile_id);
+      const conflictingService = patch.serviceId !== undefined && String(patch.serviceId) !== storedService;
+      const conflictingProfile = patch.profileId !== undefined && String(patch.profileId) !== storedProfile;
+      if (conflictingService || conflictingProfile) {
+        throw new StoreError(
+          `instanceId '${instanceId}' already belongs to service '${storedService}' / profile '${storedProfile}'; ` +
+          'its identity is immutable',
+          400,
+          'INVALID_INSTANCE'
+        );
+      }
+    }
+
+    /*
+     * `serviceId`/`profileId` are REQUIRED when creating a row. Inferring the
+     * profile from the sanctioned segment is unsound: the segment is lossy
+     * (distinct raw ids collide) and truncated at 64 chars (discovery identities
+     * are 71), so inference can address a non-existent or wrong account. Both
+     * production callers already pass `profileId` explicitly.
+     */
+    if (profileId === null || profileId === undefined || profileId === '') {
+      throw new StoreError(
+        'profileId is required to create an instance runtime record',
+        400,
+        'INVALID_PROFILE'
+      );
+    }
+    serviceId = String(serviceId);
+    profileId = String(profileId);
+
+    // Namespace integrity: the composite id must be exactly the canonical one.
+    let canonical = null;
+    try {
+      canonical = buildInstanceId(serviceId, profileId);
+    } catch (_) {
+      throw new StoreError(`Invalid instance target '${instanceId}'`, 400, 'INVALID_INSTANCE');
+    }
+    if (canonical !== instanceId) {
+      throw new StoreError(
+        `instanceId '${instanceId}' does not match service '${serviceId}' / profile '${profileId}'`,
+        400,
+        'INVALID_INSTANCE'
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    /** Normalizes one patch field to its storable SQLite value. */
+    const normalizeColumnValue = (key, rawValue) => {
+      if (key === 'pid') return positivePidOrNull(rawValue);
+      if (key === 'localPort') return positivePortOrNull(rawValue);
+      if (key === 'lastExitCode') return Number.isInteger(rawValue) ? rawValue : null;
+      if (key === 'startedAt' || key === 'observedAt') return isoOrNull(rawValue);
+      if (key === 'state') return (typeof rawValue === 'string' && rawValue) ? rawValue : 'stopped';
+      if (rawValue === null || rawValue === undefined) return null;
+      return String(rawValue);
+    };
+
+    const patchColumns = [];
+    const patchValues = [];
+    for (const key of Object.keys(INSTANCE_COLUMN_MAP)) {
+      if (key === 'instanceId') continue;
+      if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+      patchColumns.push(INSTANCE_COLUMN_MAP[key]);
+      patchValues.push(normalizeColumnValue(key, patch[key]));
+    }
+
+    if (!existing) {
+      const columns = ['instance_id', 'service_id', 'profile_id'];
+      const params = [instanceId, serviceId, profileId];
+      for (let i = 0; i < patchColumns.length; i += 1) {
+        // service_id/profile_id are already seeded above; emitting them again
+        // would produce duplicate column names in the INSERT.
+        if (patchColumns[i] === 'service_id' || patchColumns[i] === 'profile_id') continue;
+        columns.push(patchColumns[i]);
+        params.push(patchValues[i]);
+      }
+      if (!columns.includes('state')) {
+        columns.push('state');
+        params.push('stopped');
+      }
+      columns.push('created_at', 'updated_at');
+      params.push(now, now);
+      db.prepare(
+        `INSERT INTO instance_runtime (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
+      ).run(...params);
+    } else if (patchColumns.length > 0) {
+      const assignments = patchColumns.map(column => `${column} = ?`);
+      db.prepare(
+        `UPDATE instance_runtime SET ${assignments.join(', ')}, updated_at = ? WHERE instance_id = ?`
+      ).run(...patchValues, now, instanceId);
+    } else {
+      db.prepare('UPDATE instance_runtime SET updated_at = ? WHERE instance_id = ?').run(now, instanceId);
+    }
+
+    return getInstanceRuntime(instanceId);
+  }
+
+  /**
+   * Converges an instance back to "stopped" without deleting the row (the row
+   * itself is the durable history for the UI). Returns null when absent.
+   */
+  function clearInstanceRuntime(instanceId) {
+    if (typeof instanceId !== 'string' || !instanceId) {
+      throw new StoreError('instanceId is required', 400, 'INVALID_INSTANCE');
+    }
+    const existing = db.prepare('SELECT instance_id FROM instance_runtime WHERE instance_id = ?').get(instanceId);
+    if (!existing) return null;
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE instance_runtime
+      SET state = 'stopped', pid = NULL, started_at = NULL, executable_path = NULL,
+          health_url = NULL, local_port = NULL, operation_id = NULL,
+          reason_code = 'process_stopped', observed_at = ?, updated_at = ?
+      WHERE instance_id = ?
+    `).run(now, now, instanceId);
+    return getInstanceRuntime(instanceId);
+  }
+
+  /** Profile ids currently VERIFIED-running for one service (informational only). */
+  function listRunningInstanceProfileIds(serviceId) {
+    if (typeof serviceId !== 'string' || !serviceId) return [];
+    const rows = db.prepare(`
+      SELECT profile_id FROM instance_runtime
+      WHERE service_id = ? AND state = 'running' AND pid IS NOT NULL
+      ORDER BY profile_id ASC
+    `).all(serviceId);
+    return rows.map(row => row.profile_id).filter(id => typeof id === 'string' && id);
+  }
+
+  /**
+   * Service runtime DTO. Back-compatible with the previous shape
+   * ({runtimeState, activeProfileId, ...}) plus additive `instances: [...]`.
+   */
+  function getServiceRuntime(serviceId) {
+    const instances = listInstanceRuntimes(serviceId);
+    let base = null;
+    if (options?.getServiceRuntime && typeof options.getServiceRuntime === 'function') {
+      const rt = options.getServiceRuntime(serviceId);
+      if (rt && typeof rt === 'object') base = rt;
+      else if (rt) base = null;
+    }
+    if (!base || typeof base !== 'object') {
+      const row = db.prepare('SELECT profile_id, profile_revision, service_revision FROM active_profiles WHERE service_id = ?').get(serviceId);
+      base = row
+        ? {
+            runtimeState: 'running',
+            activeProfileId: row.profile_id,
+            activeProfileRevision: row.profile_revision ?? null,
+            activeServiceRevision: row.service_revision ?? null
+          }
+        : { runtimeState: 'stopped', activeProfileId: null };
+    }
+    return { ...base, instances };
+  }
+
   // Attach MCP registry
   const registry = attachRegistry({
     db,
@@ -394,22 +731,7 @@ export function openStore(options = {}) {
       return nextRev;
     },
     assertIdle: ({ excludeActionId } = {}) => assertIdle({ excludeActionId }),
-    getServiceRuntime: (serviceId) => {
-      if (options?.getServiceRuntime && typeof options.getServiceRuntime === 'function') {
-        const rt = options.getServiceRuntime(serviceId);
-        if (rt) return rt;
-      }
-      const row = db.prepare('SELECT profile_id, profile_revision, service_revision FROM active_profiles WHERE service_id = ?').get(serviceId);
-      if (!row) {
-        return { runtimeState: 'stopped', activeProfileId: null };
-      }
-      return {
-        runtimeState: 'running',
-        activeProfileId: row.profile_id,
-        activeProfileRevision: row.profile_revision ?? null,
-        activeServiceRevision: row.service_revision ?? null
-      };
-    },
+    getServiceRuntime,
     clearActiveService: (serviceId) => {
       db.prepare('DELETE FROM active_profiles WHERE service_id = ?').run(serviceId);
     }
@@ -1370,6 +1692,13 @@ export function openStore(options = {}) {
     hasProfileProvenance,
     getProfileIdByProvenance,
     listServices,
+    // Concurrent multi-profile tunnel instances (additive)
+    listInstanceRuntimes,
+    getInstanceRuntime,
+    upsertInstanceRuntime,
+    clearInstanceRuntime,
+    listRunningInstanceProfileIds,
+    getServiceRuntime,
     createOperation,
     pendingOperationIds,
     getWorkQueue,

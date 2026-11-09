@@ -2,11 +2,16 @@
 
 Windows 本地 MCP 隧道与账号管理控制台，通过浏览器管理多个账号、MCP 配置及安装位置。
 
-**当前公开预览版：[v1.2.0-preview.4](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/tag/v1.2.0-preview.4)**，部署构建标识 `20261109-rc21-r1`。应用元数据仍为 `1.0.0`，不把部署构建号冒充业务版本号。
+**当前公开预览版：[v1.2.0-preview.5](https://github.com/zwsxzy/mcp-tunnel-account-manager/releases/tag/v1.2.0-preview.5)**，部署构建标识 `20261109-rc22-r1`。应用元数据仍为 `1.0.0`，不把部署构建号冒充业务版本号。
 
-**当前分支：`final` 综合合并版**，完整合并并保留了 `main` 分支（含 v1.2.0-preview.3 的凭证掩码自愈与保护、异步监听器有界探测、审计回滚恢复）与 `new` 分支（含验证检验并发提速、进程真实 PID 观测、Windows 后端子进程隐藏控制台继承修复）的所有功能与修复，并通过了全套测试。
+**当前分支：`final` 综合合并版**，完整合并并保留了 `main` 分支（含 v1.2.0-preview.3 的凭证掩码自愈与保护、异步监听器有界探测、审计回滚恢复）、`new` 分支（含验证检验并发提速、进程真实 PID 观测、Windows 后端子进程隐藏控制台继承修复）以及 `feature/concurrent-account-tunnels` 分支（并发实例隧道）的所有功能与修复，并通过了全套测试。
 
-`v1.2.0-preview.4`（构建标识 `20261109-rc21-r1`）相对 `v1.2.0-preview.3` 的变化：合并 `new` 分支的验证并发提速、进程真实 PID 观测与 Windows 隐藏控制台继承修复；按合并后的源码重新计算 `source-core-hashes.json` 基线（旧 RC19/RC20 基线已不再成立），并在 `source-provenance.json` 中补齐 `new` 分支特性记录；修正前端编辑态下"整条服务无变更即整体省略"与测试断言不一致导致的 `ui-registry` 用例失败。
+`v1.2.0-preview.5`（构建标识 `20261109-rc22-r1`）相对 `v1.2.0-preview.4` 的变化：
+
+- **修复 HTTP 隧道回滚后无法再启动**：进程记录被 `restoreIfOwned()` 打上 `<opId>-restored` 标记后，`prepare()` 用该标记作为传输上下文去解封加密包，而 operationId 已绑定在 AES-GCM 的 AAD 中，导致每次启动/重启都以 `INVALID_HTTP_STATE` 被拒绝。现在以包内自带的 `operationId` 为准，并回退剥离 `-restored` 后缀。
+- **修复 MCP 服务无法移除**：`remove()` 读取 `rt?.state`，而运行态 DTO 实际字段是 `runtimeState` / `tunnelClient.state`，导致运行态恒为 `unknown`、所有服务都被 `RUNTIME_STATE_UNKNOWN` 拦截。现在按 `tunnelClient.state` → `state` → `runtimeState` 顺序解析，服务真实运行中仍返回 `MCP_RUNNING` 保护。
+- **修复拒绝原因不可见**：前端只读 `op.failureCode`，而生命周期动作的错误码字段是 `errorCode`，所有失败都显示成光秃秃的 `REJECTED`。现在按 `errorCode` → `error_code` → `failureCode` → `error` 回退显示。
+- 按合并后的源码重新计算 `source-core-hashes.json` 基线（RC19/RC20/RC21 基线已不再成立），构建标识更新为 rc22。
 
 ## 部署与启动
 

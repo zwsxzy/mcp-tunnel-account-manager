@@ -1,0 +1,32 @@
+{
+    "capturedAt":  "2026-11-09T18:59:26.0864790+08:00",
+    "tunnelClients":  [
+                          {
+                              "pid":  24520,
+                              "creationTimeFileTime":  "134386945842389990",
+                              "started":  "2026-11-09T18:43:04.2389990+08:00",
+                              "exe":  "D:\\mcp\\tunnel-client\\tunnel-client.exe"
+                          },
+                          {
+                              "pid":  8988,
+                              "creationTimeFileTime":  "134386945843096070",
+                              "started":  "2026-11-09T18:43:04.3096070+08:00",
+                              "exe":  "D:\\mcp\\tunnel-client\\tunnel-client.exe"
+                          },
+                          {
+                              "pid":  10100,
+                              "creationTimeFileTime":  "134386945975942820",
+                              "started":  "2026-11-09T18:43:17.5942820+08:00",
+                              "exe":  "D:\\mcp\\tunnel-client\\tunnel-client.exe"
+                          }
+                      ],
+    "port17642ListenPids":  [
+                                0
+                            ],
+    "consoleProcesses":  [
+                             {
+                                 "pid":  17704,
+                                 "creationTimeFileTime":  "134386931217711570"
+                             }
+                         ]
+}

@@ -14,7 +14,7 @@ describe('mcp-registry-store unit tests', () => {
   let db;
   let storeEvents;
 
-  function setupHarness({ runtimeState = 'stopped', busy = false } = {}) {
+  function setupHarness({ runtimeState = 'stopped', busy = false, getServiceRuntime: customRuntime = null } = {}) {
     storeEvents = {
       globalRevision: 10,
       clearedServices: [],
@@ -33,6 +33,7 @@ describe('mcp-registry-store unit tests', () => {
       }
     };
     const getServiceRuntime = (id) => {
+      if (typeof customRuntime === 'function') return customRuntime(id);
       return {
         state: typeof runtimeState === 'function' ? runtimeState(id) : runtimeState,
         activeProfileRevision: 1,
@@ -487,6 +488,45 @@ describe('mcp-registry-store unit tests', () => {
       await assert.rejects(
         () => registry.remove('overleaf-mcp'),
         (err) => err.code === 'MCP_NOT_FOUND' && err.status === 404
+      );
+    });
+
+    // Regression: the real store returns {runtimeState, activeProfileId, instances} with no
+    // top-level `state`, so remove() used to resolve 'unknown' for every service and always
+    // failed with RUNTIME_STATE_UNKNOWN - nothing could ever be removed from the console.
+    it('resolves removal state from runtimeState when no tunnelClient observation exists', async () => {
+      const { registry } = setupHarness({ runtimeState: 'stopped' });
+      const res = await registry.remove('overleaf-mcp');
+      assert.deepEqual(res, { success: true, id: 'overleaf-mcp' });
+      assert.ok(registry.getDefinition('overleaf-mcp', { includeDeleted: true }).deletedAt);
+    });
+
+    it('prefers the tunnelClient observation over a stale runtimeState', async () => {
+      // runtimeState still says running (stale pointer) but the observed client is stopped.
+      const { registry } = setupHarness({
+        getServiceRuntime: () => ({
+          runtimeState: 'running',
+          activeProfileId: null,
+          instances: [],
+          tunnelClient: { state: 'stopped' }
+        })
+      });
+      const res = await registry.remove('overleaf-mcp');
+      assert.deepEqual(res, { success: true, id: 'overleaf-mcp' });
+    });
+
+    it('still blocks removal when the observed tunnel client is running', async () => {
+      const { registry } = setupHarness({
+        getServiceRuntime: () => ({
+          runtimeState: 'stopped',
+          activeProfileId: null,
+          instances: [],
+          tunnelClient: { state: 'running' }
+        })
+      });
+      await assert.rejects(
+        () => registry.remove('overleaf-mcp'),
+        (err) => err.code === 'MCP_RUNNING' && err.status === 409
       );
     });
   });

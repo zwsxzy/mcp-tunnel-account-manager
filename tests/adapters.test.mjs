@@ -2126,6 +2126,45 @@ test('adapter exposes only allowlisted probe failure reasons and still requires 
   }
 });
 
+// Regression: a rollback restore tags the process record "<opId>-restored" (restoreIfOwned) while
+// keeping packetPath on the capsule sealed for the ORIGINAL operation. Deriving the transport
+// context from that tag made every later start/restart fail with INVALID_HTTP_STATE.
+test('42. prepare survives a -restored process-record tag by reusing the packet own operationId', async () => {
+  const { dataDir, paths } = createTempWorkspace();
+  const vault = createVault({ dataDir });
+  const processController = createFakeProcessController();
+  const probe = createFakeProbe();
+
+  try {
+    const serviceId = 'mcp_restored_tag_test';
+    const definition = {
+      id: serviceId,
+      binding: { type: 'http', url: 'https://bridge.mcp.host/v1', headers: { Authorization: { value: 'Bearer secret' } } }
+    };
+    const adapters = createAdapters({ dataDir, paths, processController, probe, vault, definitions: [definition] });
+    const adapter = adapters[serviceId];
+
+    const opOriginal = 'op-tag-original';
+    const snapOriginal = await adapter.prepare({ operationId: opOriginal, credential: { tunnelId: 'tunnel-tag', apiKey: 'key-tag' } });
+    await adapter.applyIfUnchanged({ operationId: opOriginal, snapshot: snapOriginal });
+
+    // Emulate restoreIfOwned(): process record keeps packetPath but is tagged with -restored.
+    const record = JSON.parse(fs.readFileSync(adapter.processPath, 'utf8'));
+    assert.ok(record.packetPath, 'http process record must reference its capsule');
+    record.operationId = `${opOriginal}-restored`;
+    fs.writeFileSync(adapter.processPath, JSON.stringify(record, null, 2), 'utf8');
+
+    const opNext = 'op-tag-next';
+    const snapNext = await adapter.prepare({ operationId: opNext, credential: { tunnelId: 'tunnel-tag', apiKey: 'key-tag' } });
+    assert.equal(snapNext.originalKind, 'http');
+    assert.equal(snapNext.originalOperationId, opOriginal);
+    assert.equal(snapNext.originalPacketPath, record.packetPath);
+    assert.ok(snapNext.originalFingerprint);
+  } finally {
+    vault.close();
+  }
+});
+
 after(() => {
   for (const d of createdTempDirs) {
     try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch (_) {}

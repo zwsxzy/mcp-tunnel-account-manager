@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMcpRoutes } from './http/mcp-routes.mjs';
+import { createInstanceRoutes } from './http/instance-routes.mjs';
 import { decideRecoveryAcknowledgement } from './core/recovery-acknowledgement.mjs';
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
@@ -234,11 +235,13 @@ export function createHttpServer({
   runner,
   adapters,
   adapterProvider,
+  instanceAdapterProvider,
   publicDir,
   discovery,
   importer,
   locations,
-  vault
+  vault,
+  dataDir
 } = {}) {
   if (!security || typeof security !== 'object' || typeof security.guard !== 'function') {
     throw new TypeError('SECURITY_REQUIRED: createHttpServer requires a valid security instance with guard function');
@@ -253,6 +256,14 @@ export function createHttpServer({
     vault: vault || repo?.vault,
     adapters,
     adapterProvider
+  });
+
+  const instanceRoutes = createInstanceRoutes({
+    repo,
+    runner,
+    vault: vault || repo?.vault,
+    instanceAdapterProvider: instanceAdapterProvider || null,
+    dataDir: dataDir || null
   });
 
   const server = http.createServer(async (req, res) => {
@@ -595,6 +606,19 @@ export function createHttpServer({
 
         const auth = req.authSession || { authenticated: true };
         const body = isWrite ? await readJsonBody(req) : {};
+
+        // 8a. Concurrent instance routes (/api/mcps/:id/instances[/...]).
+        //     Additive: returns false for every legacy path, in which case the
+        //     existing MCP handler below runs unchanged with the same body.
+        const instanceHandled = await instanceRoutes.handle({
+          req,
+          res,
+          url: parsedUrl,
+          body,
+          auth
+        });
+        if (instanceHandled) return;
+
         const handled = await mcpRoutes.handle({
           req,
           res,

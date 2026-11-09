@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createVault } from './vault.mjs';
 import { openStore } from './store.mjs';
-import { createAdapters, createRegisteredAdapterProvider } from './adapters/index.mjs';
+import { createAdapters, createRegisteredAdapterProvider, createInstanceAdapterProvider } from './adapters/index.mjs';
 import { createRunner } from './runner.mjs';
 import { createSecurity } from './security.mjs';
 import { createHttpServer } from './server.mjs';
@@ -254,6 +254,24 @@ export async function startManager({
     }
 
     // 5. Runner layer: pass repo: store to createRunner
+    // Concurrent-instance adapters are resolved by a SEPARATE provider. It refuses
+    // production data/profile directories, so instance actions can never write
+    // outside the isolated instance area.
+    let instanceAdapterProvider = restOptions.instanceAdapterProvider;
+    if (!instanceAdapterProvider && typeof createInstanceAdapterProvider === 'function') {
+      try {
+        instanceAdapterProvider = createInstanceAdapterProvider({
+          dataDir,
+          vault: resolvedAdapterVault,
+          store,
+          security,
+          ...adapterOptions
+        });
+      } catch (_) {
+        instanceAdapterProvider = null;
+      }
+    }
+
     const runner = (restOptions.runner && (typeof restOptions.runner.start === 'function' || typeof restOptions.runner.stop === 'function'))
       ? restOptions.runner
       : (typeof restOptions.runnerFactory === 'function'
@@ -261,6 +279,7 @@ export async function startManager({
               repo: store,
               adapters,
               adapterProvider,
+              instanceAdapterProvider,
               dataDir,
               vault: resolvedAdapterVault,
               ...restOptions.runner
@@ -269,6 +288,7 @@ export async function startManager({
               repo: store,
               adapters,
               adapterProvider,
+              instanceAdapterProvider,
               dataDir,
               vault: resolvedAdapterVault,
               ...restOptions.runner
