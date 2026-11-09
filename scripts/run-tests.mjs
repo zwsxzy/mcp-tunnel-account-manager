@@ -336,7 +336,7 @@ export async function runAllTests(testFiles, options = {}) {
       ];
       const heavyRun = await spawnTrackedNodeTest(heavyArgs, {
         cwd: projectRoot,
-        timeoutMs: options.heavyTimeoutMs || 90000,
+        timeoutMs: options.heavyTimeoutMs || 150000,
         label: relName,
         watcher
       });

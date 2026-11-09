@@ -28,7 +28,11 @@ import {
 
 export { SwitchFault, HttpTransportFault, TunnelLaunchEnvironmentFault, buildTunnelLaunchEnvironment, createTunnelProbe, defaultTunnelProbe, ServiceAdapter };
 
-export const DEFAULT_PROXY = 'http://127.0.0.1:7897';
+export function resolveDefaultProxy() {
+  return process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || 'http://127.0.0.1:7897';
+}
+
+export const DEFAULT_PROXY = resolveDefaultProxy();
 
 export const SAFE_INHERITED_KEYS = [
   'SystemRoot', 'SYSTEMROOT',
@@ -1561,25 +1565,38 @@ class ServiceAdapter {
     let probeResult;
     try {
       const explicitHealthURL = this.healthURL || snapshot?.healthURL || null;
-      const canPollEphemeral = !explicitHealthURL && Boolean(this.probe?.isDefault) && typeof this.processController?.runtimeCommand !== 'function';
-      const maxAttempts = canPollEphemeral ? 120 : 1;
+      const isRealProbe = Boolean(this.probe?.isDefault) && typeof this.processController?.runtimeCommand !== 'function';
+      const maxAttempts = isRealProbe ? (explicitHealthURL ? 120 : 150) : 1;
       let curInspected = inspected;
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (attempt > 0) {
-          await new Promise(r => setTimeout(r, 150));
+          const pollIntervalMs = isRealProbe
+            ? (attempt < 15 ? 80 : (attempt < 40 ? 150 : 250))
+            : 150;
+          await new Promise(r => setTimeout(r, pollIntervalMs));
           if (!explicitHealthURL && !curInspected?.healthURL) {
-            try {
-              curInspected = await this.processController.inspect(this.service);
-              if (curInspected?.running && curInspected.pid) {
-                identity.pid = curInspected.pid;
-                identity.startedAt = curInspected.startTime || curInspected.startedAt || identity.startedAt;
-                identity.executable = curInspected.executablePath || curInspected.executable || identity.executable;
-                listenerIdentity.pid = identity.pid;
-                listenerIdentity.startedAt = identity.startedAt;
-                listenerIdentity.executable = identity.executable;
-              }
-            } catch (_) {}
+            if (this.processPath && fs.existsSync(this.processPath)) {
+              try {
+                const rec = JSON.parse(fs.readFileSync(this.processPath, 'utf8'));
+                if (rec?.healthURL && rec.pid === (curInspected?.pid || identity.pid)) {
+                  curInspected = { ...curInspected, healthURL: rec.healthURL, localPort: rec.localPort };
+                }
+              } catch (_) {}
+            }
+            if (!curInspected?.healthURL) {
+              try {
+                curInspected = await this.processController.inspect(this.service);
+                if (curInspected?.running && curInspected.pid) {
+                  identity.pid = curInspected.pid;
+                  identity.startedAt = curInspected.startTime || curInspected.startedAt || identity.startedAt;
+                  identity.executable = curInspected.executablePath || curInspected.executable || identity.executable;
+                  listenerIdentity.pid = identity.pid;
+                  listenerIdentity.startedAt = identity.startedAt;
+                  listenerIdentity.executable = identity.executable;
+                }
+              } catch (_) {}
+            }
           }
         }
         const curHealthURL = explicitHealthURL || curInspected?.healthURL || null;
@@ -1593,7 +1610,7 @@ class ServiceAdapter {
             }
           } catch (_) {}
         }
-        if (canPollEphemeral && !curHealthURL && attempt < maxAttempts - 1) {
+        if (isRealProbe && !curHealthURL && attempt < maxAttempts - 1) {
           continue;
         }
         probeResult = await this.probe.verify({
@@ -1607,6 +1624,9 @@ class ServiceAdapter {
           controlPlaneBaseURL: snapshot?.controlPlaneBaseURL || this.paths?.controlPlaneBaseURL || this.paths?.controlPlaneBaseUrl || null
         });
         if (probeResult && probeResult.ok !== false && probeResult.verified !== false) {
+          break;
+        }
+        if (probeResult && probeResult.fatalAuth) {
           break;
         }
       }

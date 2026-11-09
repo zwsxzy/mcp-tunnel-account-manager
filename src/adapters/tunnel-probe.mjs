@@ -245,7 +245,7 @@ export function createTunnelProbe(options = {}) {
         return { ok: false, verified: false, error: 'NON_LOOPBACK_HEALTH_URL' };
       }
 
-      const timeoutMs = options.timeoutMs || 3000;
+      const timeoutMs = options.timeoutMs || 1500;
       async function fetchEndpoint(endpointPath) {
         const fullUrl = new URL(endpointPath, targetHealthUrl).href;
         if (typeof options.fetch === 'function') {
@@ -319,7 +319,16 @@ export function createTunnelProbe(options = {}) {
         };
       } catch (err) {
         if (err instanceof TargetEvidenceFault) {
-          return { ok: false, verified: false, error: err.code, code: err.code };
+          const cp = health?.components?.['control-plane'];
+          const cpDetails = cp?.details;
+          const isFatalAuth = Boolean(
+            (cpDetails?.consecutive_failures !== undefined && cpDetails.consecutive_failures > 0) ||
+            cpDetails?.http_status === 401 ||
+            cpDetails?.http_status === 403 ||
+            (cp?.reason_code && cp.reason_code !== '') ||
+            (cpDetails?.failure_category && cpDetails.failure_category !== '')
+          );
+          return { ok: false, verified: false, error: err.code, code: err.code, fatalAuth: isFatalAuth };
         }
         return { ok: false, verified: false, error: err.message };
       }

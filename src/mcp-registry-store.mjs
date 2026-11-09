@@ -1310,6 +1310,9 @@ export function attachRegistry({
       registrySnapshot: payload?.registrySnapshot,
       originalRuntime: payload?.originalRuntime,
       carrierToken: payload?.carrierToken || null,
+      carrierContext: payload?.carrierContext || null,
+      sessionBinding: payload?.sessionBinding || row.session_binding || null,
+      idempotencyKey: payload?.idempotencyKey || row.idempotency_key || null,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };

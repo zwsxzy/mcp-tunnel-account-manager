@@ -13,6 +13,7 @@ const childFixture = fileURLToPath(new URL('./fixtures/powershell-launch-env-chi
 function runProcessControl(args, stdinPayload = null) {
   return new Promise((resolve, reject) => {
     const child = spawn('powershell', [
+      '-NoProfile',
       '-ExecutionPolicy', 'Bypass',
       '-File', scriptPath,
       ...args
