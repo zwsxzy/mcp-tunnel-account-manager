@@ -45,8 +45,21 @@ function Resolve-BundleRoot {
 
 function Write-Log {
     param([string]$Message)
-    $line = ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
-    Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+    $line = ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) + "`r`n"
+    for ($i = 0; $i -lt 10; $i++) {
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+            $stream = [System.IO.File]::Open($logPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            try {
+                $stream.Write($bytes, 0, $bytes.Length)
+            } finally {
+                $stream.Close()
+            }
+            return
+        } catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
 }
 
 function Test-ConsoleReady {
@@ -56,6 +69,33 @@ function Test-ConsoleReady {
     } catch {
         return $false
     }
+}
+
+# Single-instance synchronization to prevent rapid double-click race conditions
+$launcherMutex = $null
+$ownsMutex = $false
+try {
+    $launcherMutex = New-Object System.Threading.Mutex($true, 'McpTunnelAccountManagerLauncherMutex', [ref]$ownsMutex)
+    if (-not $ownsMutex) {
+        # Another launcher instance is currently running (e.g. quick double-click). Wait up to 5s.
+        try {
+            $ownsMutex = $launcherMutex.WaitOne(5000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $ownsMutex = $true
+        }
+        if ($ownsMutex) {
+            if (Test-ConsoleReady) {
+                Write-Log 'console already ready (after waiting for sibling launcher); opening browser and exiting'
+                if (-not $NoBrowser -and -not $DryRun) {
+                    Start-Process $consoleUrl
+                }
+                try { $launcherMutex.ReleaseMutex(); $ownsMutex = $false } catch { }
+                exit 0
+            }
+        }
+    }
+} catch {
+    # If mutex fails for any reason, continue execution safely
 }
 
 try {
@@ -72,6 +112,18 @@ try {
     } else {
         Write-Log 'console not ready; starting console'
         if (-not $DryRun) {
+            # Clean duplicate case-variant environment variables (e.g. NO_PROXY and no_proxy)
+            # which cause .NET Framework ProcessStartInfo to throw ArgumentException
+            try {
+                $envVars = [System.Environment]::GetEnvironmentVariables('Process')
+                $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($k in $envVars.Keys) {
+                    if (-not $seenKeys.Add($k)) {
+                        [System.Environment]::SetEnvironmentVariable($k, $null, 'Process')
+                    }
+                }
+            } catch { }
+
             Start-Process -FilePath $psExe -WindowStyle Hidden `
                 -ArgumentList @(
                     '-NoLogo', '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
@@ -111,4 +163,9 @@ try {
             'MCP Tunnel', 'OK', 'Error') | Out-Null
     } catch { }
     exit 1
+} finally {
+    if ($null -ne $launcherMutex -and $ownsMutex) {
+        try { $launcherMutex.ReleaseMutex() } catch { }
+        try { $launcherMutex.Dispose() } catch { }
+    }
 }
