@@ -15,3 +15,11 @@ auth.json
 *.log
 *.tmp
 *.bak
+*.orig
+*~
+
+# Python 编译缓存（中间产物，不入库）
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
