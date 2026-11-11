@@ -1,0 +1,17 @@
+# 本机生成的部署配置（由 Install-And-Setup.ps1 生成，含机器相关绝对路径，不应发布）
+generated-profiles/
+
+# 运行时账号数据 / 密钥 / 日志（绝不入库；实际位置在 %LOCALAPPDATA%）
+*.db
+*.db-wal
+*.db-shm
+*.key
+bootstrap-code.txt
+auth.json
+.env
+.env.*
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak

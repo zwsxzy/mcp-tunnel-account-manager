@@ -12,21 +12,57 @@
  *   node tools/start-tunnels.mjs
  *   node tools/start-tunnels.mjs --dry-run
  */
-import { createVault } from 'file:///D:/MCP/console/src/vault.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const BUNDLE = 'D:\\MCP';
-const DATA = path.join(process.env.LOCALAPPDATA, 'McpTunnelAccountManager');
+// 本文件位于 <BUNDLE>/tools/start-tunnels.mjs，因此往上一级就是部署包根目录。
+// 不再写死盘符：无论包被解压到哪个目录都能运行。
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const BUNDLE = path.resolve(__dirname, '..');
+
+const { createVault } = await import(pathToFileURL(path.join(BUNDLE, 'console', 'src', 'vault.mjs')).href);
+const DATA = path.join(process.env.LOCALAPPDATA || process.env.HOME || __dirname, 'McpTunnelAccountManager');
 const CLIENT = path.join(BUNDLE, 'tunnel-client', 'tunnel-client.exe');
-const PROXY = 'http://127.0.0.1:7897';
+// 可选 HTTP 代理：默认不启用，需要时用 MCP_PROXY 环境变量指定（例如 http://127.0.0.1:7897）。
+const PROXY = process.env.MCP_PROXY || '';
 const LOGDIR = path.join(DATA, 'logs');
 const NODE = path.join(BUNDLE, 'console', 'runtime', 'node.exe');
-const PYTHON = 'D:\\zws\\anaconda3\\python.exe';
 const OVERLEAF_ENTRY = path.join(BUNDLE, 'servers', 'overleaf-mcp', 'node_modules', 'mcp-server-overleaf', 'dist', 'index.js');
 const ANTIGRAVITY_HOME = path.join(BUNDLE, 'servers', 'antigravity-mcp');
+
+/**
+ * 解析 Python 解释器，按优先级：
+ *   1. 环境变量 MCP_PYTHON
+ *   2. 常见安装位置（含 venv、conda）
+ *   3. PATH 上的 python.exe / python3
+ * 找不到时返回 null（antigravity 隧道将无法启动，overleaf/deepseek 不受影响）。
+ */
+function resolvePython() {
+  const candidates = [];
+  if (process.env.MCP_PYTHON) candidates.push(process.env.MCP_PYTHON);
+  const local = process.env.LOCALAPPDATA || '';
+  candidates.push(path.join(BUNDLE, '.venv', 'Scripts', 'python.exe'));
+  if (local) candidates.push(path.join(local, 'Programs', 'Python', 'Python313', 'python.exe'));
+  if (local) candidates.push(path.join(local, 'Programs', 'Python', 'Python312', 'python.exe'));
+  if (local) candidates.push(path.join(local, 'Programs', 'Python', 'Python311', 'python.exe'));
+  candidates.push('C:\\Python313\\python.exe', 'C:\\Python312\\python.exe', 'C:\\Python311\\python.exe');
+  for (const c of candidates) {
+    try { if (c && fs.existsSync(c)) return c; } catch { /* ignore */ }
+  }
+  for (const name of ['python.exe', 'python3.exe', 'python', 'python3']) {
+    try {
+      const out = execFileSync('where', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .split(/\r?\n/).map((s) => s.trim()).find((s) => s);
+      if (out) return out;
+    } catch { /* not found on PATH */ }
+  }
+  return null;
+}
+
+const PYTHON = resolvePython();
 
 const argv = process.argv.slice(2);
 const dryRun = argv.includes('--dry-run');
@@ -90,18 +126,20 @@ function stopExisting() {
 function launch(job) {
   const args = ['run', '--config', job.config,
     '--health.listen-addr', '127.0.0.1:0',
-    '--http-proxy', PROXY,
     '--control-plane.poll-timeout', '10s',
     '--control-plane.initial-poll-timeout', '100ms'];
+  if (PROXY) args.push('--http-proxy', PROXY);
   
   const filteredPath = pathWithoutNpm();
   
   const env = {
     ...process.env,
     CONTROL_PLANE_API_KEY: job.apiKey,
-    HTTP_PROXY: PROXY, HTTPS_PROXY: PROXY, ALL_PROXY: PROXY,
     ...(job.env || {}),
   };
+  if (PROXY) {
+    env.HTTP_PROXY = PROXY; env.HTTPS_PROXY = PROXY; env.ALL_PROXY = PROXY;
+  }
   
   // 只有当 codexEnabled 为 false 时，才覆盖 PATH 和 Path
   if (!codexEnabled) {
@@ -125,9 +163,9 @@ function launch(job) {
 }
 
 const overleafCmd = q([NODE, OVERLEAF_ENTRY, '--stdio']);
-const antigravityCmd = q([PYTHON, '-m', 'antigravity_mcp']);
 
 console.log('启动模式: separate（三个独立 tunnel-client 隧道）');
+console.log(`  部署包目录: ${BUNDLE}`);
 const ids = dryRun ? [] : stopExisting();
 if (ids.length) console.log('  已停止既有隧道 PID:', ids.join(', '));
 launch({
@@ -137,13 +175,18 @@ launch({
   apiKey: creds['overleaf-mcp'].apiKey,
   env: { DEPLOYMENT_MCP_COMMAND: overleafCmd },
 });
-launch({
-  name: 'antigravity',
-  config: path.join(BUNDLE, 'generated-profiles', 'antigravity-local.yaml'),
-  cwd: ANTIGRAVITY_HOME,
-  apiKey: creds['antigravity-mcp'].apiKey,
-  env: { DEPLOYMENT_MCP_COMMAND: antigravityCmd, PYTHONPATH: ANTIGRAVITY_HOME },
-});
+if (PYTHON) {
+  const antigravityCmd = q([PYTHON, '-m', 'antigravity_mcp']);
+  launch({
+    name: 'antigravity',
+    config: path.join(BUNDLE, 'generated-profiles', 'antigravity-local.yaml'),
+    cwd: ANTIGRAVITY_HOME,
+    apiKey: creds['antigravity-mcp'].apiKey,
+    env: { DEPLOYMENT_MCP_COMMAND: antigravityCmd, PYTHONPATH: ANTIGRAVITY_HOME },
+  });
+} else {
+  console.warn('  [skip] antigravity：未找到 Python 解释器。请安装 Python 3.9+，或设置环境变量 MCP_PYTHON 指向 python.exe 后重试。');
+}
 launch({
   name: 'deepseek-bridge',
   config: path.join(BUNDLE, 'generated-profiles', 'deepseek-local.yaml'),
