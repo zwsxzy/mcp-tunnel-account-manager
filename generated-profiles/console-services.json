@@ -1,0 +1,26 @@
+{
+    "mcpServers":  {
+                       "overleaf-mcp":  {
+                                            "command":  "D:\\MCP\\console\\runtime\\node.exe",
+                                            "args":  [
+                                                         "D:\\MCP\\servers\\overleaf-mcp\\node_modules\\mcp-server-overleaf\\dist\\index.js",
+                                                         "--stdio"
+                                                     ],
+                                            "cwd":  "D:\\MCP",
+                                            "env":  {
+
+                                                    }
+                                        },
+                       "antigravity-mcp":  {
+                                               "command":  "D:\\zws\\anaconda3\\python.exe",
+                                               "args":  [
+                                                            "-m",
+                                                            "antigravity_mcp"
+                                                        ],
+                                               "cwd":  "D:\\MCP\\servers\\antigravity-mcp",
+                                               "env":  {
+
+                                                       }
+                                           }
+                   }
+}

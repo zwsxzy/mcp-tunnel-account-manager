@@ -1,0 +1,17 @@
+{
+  "name": "mcp-tunnel-account-manager",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Multi-account tunnel manager for Overleaf and Antigravity MCP with local-first secure vault",
+  "scripts": {
+    "start": "node scripts/launch-manager.mjs",
+    "test": "node --test tests/release-deployment.test.mjs",
+    "test:release": "node --test tests/release-deployment.test.mjs",
+    "check": "node scripts/check.mjs",
+    "validate-all": "node scripts/check.mjs && node --test tests/release-deployment.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  }
+}

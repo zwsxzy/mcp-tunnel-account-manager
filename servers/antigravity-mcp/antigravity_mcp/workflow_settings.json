@@ -1,0 +1,15 @@
+{
+  "default_model": "Gemini 3.8 Flash (High)",
+  "planner": "gpt",
+  "mode": "native_multi_parent",
+  "max_parents": null,
+  "min_workers_per_parent": 2,
+  "max_workers": null,
+  "min_agents_per_worker": 2,
+  "max_agents_per_worker": null,
+  "single_parent_conversation": false,
+  "same_ide": true,
+  "subagent_model": "inherit",
+  "independent_tasks_required": true,
+  "require_all_terminal_results": true
+}

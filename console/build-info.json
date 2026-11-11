@@ -1,0 +1,25 @@
+{
+  "releaseId": "20261109-rc21-r1",
+  "applicationVersion": "1.0.0",
+  "sourceSnapshot": "release-candidate-21-20261109",
+  "coreSourceUnchanged": true,
+  "coreSourceFiles": 35,
+  "coreHashManifest": "source-core-hashes.json",
+  "appLicense": "not-specified-in-input",
+  "upstreamFullRegressionSuiteIncluded": false,
+  "includedRuntime": {
+    "version": "v25.9.0",
+    "platform": "win32",
+    "arch": "x64",
+    "sha256": "98843732431bad6c2c165908bb7dde6fe2a221ddbc491a955d548a2e6ab9ebff",
+    "licenseSha256": "d94dd7496d4de9cd130f1eb6e661e43422483663fd48cf3a450d244b9cda6fdc",
+    "origin": "supplied-verified-local-runtime"
+  },
+  "externalRequirements": [
+    "Windows x64",
+    "Python 3.9+ for Antigravity",
+    "Antigravity IDE and login",
+    "DSH host and bridge dependencies if enabled",
+    "Network and service authorization"
+  ]
+}

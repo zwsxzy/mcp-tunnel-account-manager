@@ -1,0 +1,56 @@
+{
+  "bundleKind": "mcp-windows-deployment-kit",
+  "bundleVersion": "20261109-rc21-r1",
+  "consoleRelativePath": "console",
+  "sourceCoreHashManifest": "console/source-core-hashes.json",
+  "platform": "win32-x64",
+  "accountDataIncluded": false,
+  "credentialsIncluded": false,
+  "components": {
+    "console": {
+      "version": "1.0.0",
+      "sourceSnapshot": "release-candidate-21-20261109"
+    },
+    "node": {
+      "version": "v25.9.0",
+      "platform": "win32",
+      "arch": "x64",
+      "path": "console/runtime/node.exe",
+      "sha256": "98843732431bad6c2c165908bb7dde6fe2a221ddbc491a955d548a2e6ab9ebff",
+      "licensePath": "console/runtime/LICENSE"
+    },
+    "tunnelClient": {
+      "versionOutput": "0.0.19+01d67bb4da0d8359b808b4761f8db171ab682cd7 (git sha: 01d67bb4da0d8359b808b4761f8db171ab682cd7)",
+      "sha256": "7e93a39a567c87154a0aef2091b81100d78f9093c4603412cc2b55bed3dfe5ea"
+    },
+    "cloudflared": {
+      "versionOutput": "cloudflared version 2026.10.2 (built 2026-10-20T09:17:30Z)",
+      "sha256": "581ea1df46a9d61ead0916b389bd6cca8a14d5a3090e656c8317aa41a617a6d4"
+    },
+    "overleaf": {
+      "version": "0.3.9",
+      "nodeRequirement": ">=22.14.0",
+      "runtimeDependenciesIncluded": true,
+      "lockfile": "servers/overleaf-mcp/package-lock.json"
+    },
+    "antigravity": {
+      "version": "1.1.0.post1",
+      "distribution": "antigravity-mcp-fork",
+      "upstream": "https://github.com/Kio-pon/antigravity-mcp",
+      "upstreamBaseCommit": "eebf18edac29a72c113c6841d43d494df9acf823",
+      "forkRepository": "https://github.com/zwsxzy/antigravity-mcp-fork",
+      "toolCount": 8,
+      "pythonRequirement": ">=3.9",
+      "pythonRuntimeIncluded": false,
+      "dependencies": "Python standard library"
+    },
+    "deepseekBridge": {
+      "version": "0.6.0",
+      "runtimeDependenciesIncluded": false,
+      "dshHostIncluded": false,
+      "optional": true
+    }
+  },
+  "thirdPartyProvenance": "Copied from a supplied local deployment kit with existing license and component metadata; no upstream downloads or online authenticity checks were performed.",
+  "realServiceEndToEndVerified": false
+}
