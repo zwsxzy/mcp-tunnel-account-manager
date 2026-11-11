@@ -238,6 +238,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Stop-Mcp.ps1
 
 行为约定：只停本部署的 `tunnel-client.exe`（核对可执行路径与创建时间，不裸 PID kill）；绝不触碰 DSH / Antigravity IDE / Codex app-server 等宿主；幂等（没运行返回 `IDLE`、退出码 0）；不修改 `manager.db` / `master.key`。
 
+### 环境变量（可移植性）
+
+`start-tunnels.mjs` 与启动器**不写死任何盘符或用户路径**，部署包解压到哪里都能运行：
+
+| 环境变量 | 作用 | 默认 |
+| :--- | :--- | :--- |
+| `MCP_PYTHON` | 指定 Antigravity MCP 使用的 `python.exe`。不设时自动在 venv、`%LOCALAPPDATA%\Programs\Python\*`、`C:\Python31x` 及 PATH 中查找；找不到只跳过 Antigravity 隧道，不影响 Overleaf | 自动探测 |
+| `MCP_PROXY` | 为隧道设置 HTTP 代理（如 `http://127.0.0.1:7897`） | 不启用代理 |
+
+> 本机生成的 [generated-profiles](<generated-profiles/>) 与账号数据不随仓库发布（已在 `.gitignore` 中排除），由 `Install-And-Setup.ps1` 在目标机现场生成。
+
 ---
 
 ## 🔑 Tunnel ID 从哪来？
