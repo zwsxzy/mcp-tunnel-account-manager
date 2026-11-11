@@ -1,11 +1,36 @@
 # MCP Windows 完整部署工具包 ⚡
 
+![platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?logo=windows)
+![node](https://img.shields.io/badge/Node.js-v25.9.0%20(自带)-339933?logo=node.js&logoColor=white)
+![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-ready-6E56CF)
+![tunnel](https://img.shields.io/badge/tunnel--client-0.0.19-F38020?logo=cloudflare&logoColor=white)
+![license](https://img.shields.io/badge/license-见%20NOTICES-lightgrey)
+![star](https://img.shields.io/badge/⭐-Star%20支持一下-yellow)
+
 > **一个包，把 ChatGPT 网页版接到你自己的电脑上。**
 > 本地优先 · 不携带账号与密钥 · 一条命令拉起隧道 · 网页控制台统一管理
 
 **构建标识：20261109-rc21-r1 · Windows 10/11 x64**
 
 > ⭐ **如果这个项目帮你省了时间，请点右上角 Star —— 你的一个 Star 是这个工具继续更新的最大动力！**
+
+---
+
+## 📖 目录
+
+- [这是什么？为什么值得用？](#这是什么为什么值得用)
+- [包里有什么](#-包里有什么)
+- [快速上手（5 分钟）](#-快速上手5-分钟)
+- [在控制台里配置 MCP（重点）](#-如何在控制台里配置-mcp重点)
+- [装机指南 A：安装 MCP 控制台本身](#-装机指南-a安装-mcp-控制台本身)
+- [装机指南 B：安装 Overleaf MCP](#-装机指南-b安装-overleaf-mcp)
+- [装机指南 C：安装 Antigravity MCP](#-装机指南-c安装-antigravity-mcp)
+- [装机指南 D：安装 DSH MCP（可选）](#-装机指南-d安装-dsh-mcp可选-chatgpt-桥接)
+- [装机指南 E：安装 tunnel-client 并与 MCP 联动](#-装机指南-e安装-tunnel-client并把它和-mcp-联系起来)
+- [Tunnel ID 从哪来？](#-tunnel-id-从哪来)
+- [数据、安全与升级](#-数据安全与升级)
+- [常见问题](#常见问题)
+- [一起把它变得更好](#-一起把它变得更好)
 
 ---
 
@@ -282,11 +307,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Stop-Mcp.ps1
 
 ## 🙌 一起把它变得更好
 
-如果这个项目让你少踩了坑：
+如果这个项目让你少踩了坑、省下了折腾服务器的时间：
 
-- ⭐ **Star 本仓库**——这是最直接的支持！
+- ⭐ **点个 Star 就是最好的支持！** 它能让更多需要「本地 MCP + 隧道」的人找到这个项目，也让作者更有动力持续更新。
 - 🐞 遇到问题提 Issue，带上复现步骤和 `console/logs` 片段。
 - 🔧 欢迎 PR：新的 MCP 服务适配、文档改进、Windows 兼容性修复。
+- 📣 觉得好用，转给正在为 MCP 配置头疼的朋友。
+
+**⭐ Star · 🐞 Issue · 🔧 PR —— 每一点参与都让这个工具更好用。**
 
 ---
 
