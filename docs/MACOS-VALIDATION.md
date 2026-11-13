@@ -30,9 +30,9 @@ under `/tmp`; tests clean those endpoints after use. They are not publishable ar
 
 ### Local complete-unit result, 2026-11-13
 
-The complete default unit run on Linux / Node.js 24.22.1 passed **67 of 67 files**
-(64 light, 3 heavy), with **0 failed files**, exit code **0**, in **19.082 seconds**.
-The report is `artifacts/mac-port-20261113/unit-final/report.json`; the full output
+The complete default unit run on Linux / Node.js 24.22.1 passed **68 of 68 files**
+(65 light, 3 heavy), with **0 failed files**, exit code **0**, in **18.416 seconds**.
+The report is `artifacts/mac-port-20261113/unit-ci-fix/report.json`; the full output
 is alongside it as `full-unit.log`. Platform skips described below are explicit.
 This is local evidence; native macOS results must be read from Actions.
 
@@ -94,6 +94,17 @@ converging stored state. External processes remain outside its stopping scope.
 Short-lived `ps`/`lsof` helpers have a shared physical concurrency budget with a
 reserved stop lane. A public timeout does not release the physical lease before
 helper exit is observed. Stop retries remain inside the configured operation budget.
+
+Exit proofs reread the same launch's private control record before and after OS
+probes. Newly recorded escaped descendants cannot be omitted, and the final stopped
+record retains the supervisor's escalation evidence. A changed launch or changed
+descendant evidence yields an unconfirmed result instead of overwriting it.
+
+Public admission, helper and observation deadlines retain an event-loop reference
+until their result settles. Eight independent Node subprocess regressions check
+timeouts, physical lease retention and cleanup without relying on test-runner
+handles. Fake-service queue/recovery tests inject a fixed available-memory probe;
+the production memory reserves, concurrency limits and timeout budgets are unchanged.
 
 The default Mac console uses a dedicated `runtime/instances` scope for concurrent
 instances, below its private data directory. Each account retains its own profile,

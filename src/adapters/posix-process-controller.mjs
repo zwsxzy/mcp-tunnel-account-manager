@@ -148,6 +148,23 @@ export function createPosixProcessController({
     return control ? validateControl(control, scope) : null;
   }
 
+  function latestControl(previous) {
+    const current = loadControl(previous.scope);
+    if (!current || current.launchId !== previous.launchId || current.token !== previous.token ||
+        current.socketPath !== previous.socketPath || current.transport !== previous.transport ||
+        (previous.supervisorPid && current.supervisorPid !== previous.supervisorPid) ||
+        (previous.supervisor && !sameProcessIdentity(current.supervisor, previous.supervisor)) ||
+        (previous.record && !sameProcessIdentity(current.record, previous.record))) {
+      throw processFault('PROCESS_IDENTITY_MISMATCH');
+    }
+    return current;
+  }
+
+  function absenceEvidence(control) {
+    return JSON.stringify([control.supervisor, control.supervisorPid, control.record,
+      control.escapedProcesses || [], control.descendantsUnverified === true]);
+  }
+
   function recordFor(control, stored) {
     const record = stored?.posix?.launchId === control.launchId ? stored : control.record;
     if (!record || record.posix?.scope !== control.scope || record.posix?.launchId !== control.launchId ||
@@ -155,7 +172,12 @@ export function createPosixProcessController({
     return record;
   }
 
-  async function proveAbsent(control, { critical = false } = {}) {
+  async function proveAbsent(control, { critical = false, persistStopped = false } = {}) {
+    // A Darwin owner probe spans several asynchronous helpers. The supervisor
+    // may persist its final escaped identities and escalation receipt before
+    // exiting during that probe; the earlier snapshot is not an exit proof.
+    control = latestControl(control);
+    const evidence = absenceEvidence(control);
     // Even after the root exits, a cloudflared/MCP listener can remain. A stopped
     // receipt is forbidden until the whole anchored process group is gone.
     const pgid = control.supervisor?.pid || control.supervisorPid;
@@ -174,7 +196,15 @@ export function createPosixProcessController({
       if (sameProcessIdentity(live, escaped)) throw processFault('PROCESS_DESCENDANTS_UNCONFIRMED', undefined, { exitUnconfirmed: true });
     }
     if (control.descendantsUnverified === true) throw processFault('PROCESS_DESCENDANTS_UNCONFIRMED', undefined, { exitUnconfirmed: true });
-    cleanupControlEndpoint(control);
+    const latest = latestControl(control);
+    if (absenceEvidence(latest) !== evidence) {
+      throw processFault('PROCESS_DESCENDANTS_UNCONFIRMED', undefined, { exitUnconfirmed: true });
+    }
+    // No await separates this final generation/evidence check from persistence
+    // and endpoint cleanup. Merge the latest metadata, never the probe snapshot.
+    if (persistStopped) writeJsonFile(processPaths(dataDir, control.scope).controlFile,
+      { ...latest, state: 'stopped', stoppedAt: latest.stoppedAt || new Date().toISOString() });
+    cleanupControlEndpoint(latest);
     return { running: false, absenceVerified: true, pid: recorded?.pid || null,
       operationId: recorded?.operationId || null, service: control.scope };
   }
@@ -199,7 +229,7 @@ export function createPosixProcessController({
       status = await requestControl(control, 'inspect', undefined, { timeoutMs: controlTimeoutMs });
     } catch (error) {
       const after = await reader.readProcess(supervisorPid, { critical, includeCommandLine: false });
-      if (!after || after.running === false) return proveAbsent(loadControl(control.scope) || control, { critical });
+      if (!after || after.running === false) return proveAbsent(control, { critical });
       throw error;
     }
     if (!sameProcessIdentity(status.identity, record) || status.supervisorPid !== supervisorPid) {
@@ -299,11 +329,10 @@ export function createPosixProcessController({
     const deadline = Date.now() + stopTimeoutMs;
     let retryAt = Date.now() + 250;
     while (Date.now() < deadline) {
-      control = loadControl(scope) || control;
+      control = latestControl(control);
       const owner = await reader.readProcess(control.supervisor?.pid || control.supervisorPid, { critical: true, includeCommandLine: false });
       if (!owner || owner.running === false || !sameProcessIdentity(owner, control.supervisor)) {
-        await proveAbsent(control, { critical: true });
-        writeJsonFile(processPaths(dataDir, scope).controlFile, { ...control, state: 'stopped', stoppedAt: new Date().toISOString() });
+        await proveAbsent(control, { critical: true, persistStopped: true });
         return { stopped: true };
       }
       if (control.state === 'unconfirmed' && Date.now() >= retryAt) {

@@ -125,8 +125,13 @@ test('default macOS dispatch never starts PowerShell and verifies an empty owned
 test('native POSIX launch preserves explicit environment/argv and observes only the owned listener', native, async t => {
   const f = fixture(t);
   const output = path.join(f.directory, 'env.json');
+  // CoreFoundation initializes this UID-qualified value on macOS. Supply a
+  // valid, deterministic value so the entire environment still compares
+  // exactly; no unexpected inherited variable (including secrets) is ignored.
   const env = Object.freeze({ PATH: process.env.PATH || '/usr/bin:/bin', FIXTURE_OUTPUT: output,
-    SYNTHETIC_SECRET: 'fixture-only-value', CASE_sensitive: 'unchanged' });
+    SYNTHETIC_SECRET: 'fixture-only-value', CASE_sensitive: 'unchanged',
+    ...(process.platform === 'darwin'
+      ? { __CF_USER_TEXT_ENCODING: `0x${process.getuid().toString(16).toUpperCase()}:0x0:0x0` } : {}) });
   const args = [f.script, 'a b', '$(not-a-shell)', 'quote"and\''];
   const identity = await f.launch('mcp_env', { args, env });
   const childInfo = await waitFor(() => fs.existsSync(output) && JSON.parse(fs.readFileSync(output, 'utf8')));
@@ -278,6 +283,72 @@ function syntheticControl(t, readerOverrides = {}, request = async () => { throw
   const controller = createPosixProcessController({ dataDir, platform: 'darwin', processReader: reader, requestControl: request });
   return { dataDir, scope, owner, identity, control, controller, reader };
 }
+
+test('stop preserves supervisor escalation metadata written during the owner exit probe', async t => {
+  let stopping = false;
+  const f = syntheticControl(t, {}, async (_control, action) => {
+    if (action === 'stop') { stopping = true; return { accepted: true }; }
+    return { state: 'running', supervisorPid: f.owner.pid, rootRunning: true, identity: f.identity };
+  });
+  const file = processPaths(f.dataDir, f.scope).controlFile;
+  f.reader.readProcess = async pid => {
+    if (!stopping) return pid === f.owner.pid ? f.owner : f.identity;
+    if (pid === f.owner.pid) {
+      // The supervisor persists the final receipt and then kills its group
+      // while the manager's asynchronous process observation is in flight.
+      writeJsonFile(file, { ...f.control, state: 'stopping', killEscalated: true,
+        stopReason: 'requested', escapedProcesses: [], descendantsUnverified: false });
+    }
+    return null;
+  };
+  assert.deepEqual(await f.controller.stop(f.identity), { stopped: true });
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.state, 'stopped');
+  assert.equal(saved.killEscalated, true);
+  assert.equal(saved.stopReason, 'requested');
+  assert.deepEqual(saved.escapedProcesses, []);
+  assert.equal(saved.descendantsUnverified, false);
+});
+
+test('absence uses newly persisted escaped identities after owner exit or control loss', async t => {
+  for (const event of ['owner-exit', 'owner-reuse', 'control-loss']) {
+    await t.test(event, async t => {
+      const f = syntheticControl(t, {}, async () => { throw processFault('PROCESS_CONTROL_UNAVAILABLE'); });
+      const file = processPaths(f.dataDir, f.scope).controlFile;
+      const escaped = { ...f.identity, pid: 333, pgid: 333, processStartToken: 'escaped-birth' };
+      let ownerReads = 0;
+      f.reader.readProcess = async pid => {
+        if (pid === f.owner.pid) {
+          ownerReads += 1;
+          if (event === 'control-loss' && ownerReads === 1) return f.owner;
+          writeJsonFile(file, { ...f.control, state: 'stopping', escapedProcesses: [escaped] });
+          return event === 'owner-reuse' ? { ...f.owner, processStartToken: 'replacement-birth' } : null;
+        }
+        return pid === escaped.pid ? escaped : null;
+      };
+      await assert.rejects(f.controller.inspect(f.scope), { code: 'PROCESS_DESCENDANTS_UNCONFIRMED' });
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).state, 'stopping');
+    });
+  }
+});
+
+test('absence refuses changed descendant evidence or a replacement launch during its probes', async t => {
+  for (const change of ['descendants', 'launch']) {
+    await t.test(change, async t => {
+      const f = syntheticControl(t);
+      const file = processPaths(f.dataDir, f.scope).controlFile;
+      const changed = change === 'descendants'
+        ? { ...f.control, escapedProcesses: [{ ...f.identity, pid: 333, pgid: 333, processStartToken: 'escaped-birth' }] }
+        : { ...f.control, launchId: 'abcdefab-1234-1234-1234-123456789abc', token: 'b'.repeat(64) };
+      f.reader.listGroup = async () => { writeJsonFile(file, changed); return []; };
+      await assert.rejects(f.controller.inspect(f.scope), {
+        code: change === 'descendants' ? 'PROCESS_DESCENDANTS_UNCONFIRMED' : 'PROCESS_IDENTITY_MISMATCH'
+      });
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), changed,
+        'the old observation must neither release nor overwrite new ownership evidence');
+    });
+  }
+});
 
 test('PID reuse and orphaned recorded descendants never become false absence or numeric kill authority', async t => {
   const f = syntheticControl(t);

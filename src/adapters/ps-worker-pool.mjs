@@ -168,7 +168,9 @@ export function createPsWorkerPool(options = {}) {
           }));
       } catch (_) {}
     }, executionTimeoutMs);
-    if (typeof entry.execTimer?.unref === 'function') entry.execTimer.unref();
+    // The deadline owns the public request's remaining lifetime even if the
+    // worker exposes no referenced handle. Its expiry still retains the real
+    // pipe occupancy until a late response or worker death proves it free.
   }
 
   function dispatch(entry) {
@@ -316,7 +318,8 @@ export function createPsWorkerPool(options = {}) {
       settleReject(entry, fault(PS_FAULT_CODES.QUEUE_TIMEOUT, 'PS worker request waited too long in queue',
         { dispatched: false, critical }));
     }, queueWaitTimeoutMs);
-    if (typeof entry.queueTimer?.unref === 'function') entry.queueTimer.unref();
+    // A queued caller must receive its timeout even with no other event-loop
+    // handles. Dispatch, close, and worker failure clear this referenced timer.
   }
 
   function send(scriptPath, params, { critical = false } = {}) {
@@ -501,7 +504,8 @@ export function createHelperBudget(options = {}) {
         reject(new PsWorkerFault(PS_FAULT_CODES.QUEUE_TIMEOUT, 'PS helper waited too long for a slot',
           { dispatched: false, critical: role }));
       }, waitTimeoutMs);
-      if (typeof waiter.timer?.unref === 'function') waiter.timer.unref();
+      // A pending acquire owns this bounded timer until grant, timeout, or
+      // close; unref would let the public promise disappear on process exit.
     });
   }
 

@@ -789,6 +789,8 @@ export function createDefaultProcessController({
       // helperKillGraceMs bounds only the PUBLIC wait: past it the caller gets an
       // explicit `exitUnconfirmed` error, while the physical lease stays with the
       // still-running child until it really closes. It is never force-released.
+      // These deadlines settle the public Promise, so keep them referenced even
+      // when a child/proxy has no other event-loop handles. finish clears them.
       deadline = setTimeoutFn(() => {
         timedOut = true;
         try { child.kill(); } catch (_) {}
@@ -802,9 +804,7 @@ export function createDefaultProcessController({
           }
           finish(reject, Object.assign(timeoutFault(), { exitUnconfirmed: true }));
         }, helperKillGraceMs);
-        if (typeof graceTimer.unref === 'function') graceTimer.unref();
       }, helperExecutionTimeoutMs);
-      if (typeof deadline.unref === 'function') deadline.unref();
       if (child.stdout && typeof child.stdout.on === 'function') {
         child.stdout.on('data', d => { stdout += d; });
       } else {

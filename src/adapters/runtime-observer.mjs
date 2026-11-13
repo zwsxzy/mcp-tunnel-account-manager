@@ -281,7 +281,8 @@ export function createRuntimeObserver(options = {}) {
         resolve({ state: target.transport === 'http' ? 'unreachable' : 'check_failed',
           reasonCode: 'timeout', source, observedAt: now(), evidence: { mcpVerified: false } });
       }, timeoutMs);
-      if (typeof timer?.unref === 'function') timer.unref();
+      // A pending public observation must reach its deadline even when the
+      // injected probe has no OS handle. The cycle's finally clears this timer.
     });
     const runCycle = async () => {
       // The gate is acquired for the actual probe only. If the bounded wait

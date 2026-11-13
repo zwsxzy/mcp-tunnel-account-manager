@@ -19,6 +19,19 @@ import { executeOperation } from '../../src/core/switch-core.mjs';
 import { runMcpStopAction } from '../../src/core/mcp-lifecycle.mjs';
 import { acquireDaemonLock, DaemonLockError } from '../../src/core/daemon-lock.mjs';
 
+// Queue/recovery tests use fake services, so they must not depend on the host's
+// current free memory. Keep the real admission policy and every default budget;
+// inject only the available-memory probe for each independent runner.
+function createTestRunner(options) {
+  return createRunner({
+    ...options,
+    resourcePolicyOptions: {
+      availableMemoryBytes: () => 16 * 1024 ** 3,
+      ...options.resourcePolicyOptions
+    }
+  });
+}
+
 function createTempDir(prefix = 'recovery-reg-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -709,7 +722,7 @@ test('runner startup recovery: recovers interrupted nonterminal operation before
       }
     };
 
-    runner = createRunner({
+    runner = createTestRunner({
       repo: store,
       adapters: { 'overleaf-mcp': mockAdapter },
       dataDir: tmpDir
@@ -812,7 +825,7 @@ test('runner startup recovery: restore failure transitions operation to NEEDS_AT
       }
     };
 
-    runner = createRunner({
+    runner = createTestRunner({
       repo: store,
       adapters: { 'overleaf-mcp': failingAdapter },
       dataDir: tmpDir
@@ -880,7 +893,7 @@ test('runner startup recovery: interrupted stop action transitions to NEEDS_ATTE
     db.close();
     db = null;
 
-    runner = createRunner({
+    runner = createTestRunner({
       repo: store,
       adapters: {
         'overleaf-mcp': {
@@ -937,7 +950,7 @@ test('runner startup recovery: corrupt or missing load triggers rollback releasi
       }
     };
 
-    runner = createRunner({
+    runner = createTestRunner({
       repo: corruptRepo,
       adapters: {},
       dataDir: tmpDir
@@ -958,7 +971,7 @@ test('runner startup recovery: corrupt or missing load triggers rollback releasi
     const cleanRepo = {
       async getWorkQueue() { return []; }
     };
-    cleanRunner = createRunner({
+    cleanRunner = createTestRunner({
       repo: cleanRepo,
       adapters: {},
       dataDir: tmpDir
@@ -1011,7 +1024,7 @@ test('runner drain: terminal and attention items in stale queue produce zero dis
       }
     };
 
-    runner = createRunner({
+    runner = createTestRunner({
       repo: fakeRepo,
       adapters: {
         'overleaf-mcp': {
@@ -1056,7 +1069,7 @@ test('runner startup: supports both synchronous SQLite and asynchronous injected
         return { id, status: 'SUCCEEDED' };
       }
     };
-    syncRunner = createRunner({ repo: syncRepo, adapters: {}, dataDir: tmpDirSync });
+    syncRunner = createTestRunner({ repo: syncRepo, adapters: {}, dataDir: tmpDirSync });
     await syncRunner.start();
     assert.equal(syncLoaded, true);
     await syncRunner.stop();
@@ -1072,7 +1085,7 @@ test('runner startup: supports both synchronous SQLite and asynchronous injected
         return { id, status: 'SUCCEEDED' };
       }
     };
-    asyncRunner = createRunner({ repo: asyncRepo, adapters: {}, dataDir: tmpDirAsync });
+    asyncRunner = createTestRunner({ repo: asyncRepo, adapters: {}, dataDir: tmpDirAsync });
     await asyncRunner.start();
     assert.equal(asyncLoaded, true);
     await asyncRunner.stop();

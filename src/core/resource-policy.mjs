@@ -206,7 +206,9 @@ export function createResourcePolicy(options = {}) {
         if (index !== -1) waiters.splice(index, 1);
         reject(new ResourceAdmissionFault('START_QUEUE_TIMEOUT', { role, serviceId }));
       }, waitTimeoutMs);
-      if (typeof waiter.timer?.unref === 'function') waiter.timer.unref();
+      // This deadline settles a public admission promise. Keep its handle
+      // referenced until timeout, admission, or close; otherwise a caller with
+      // no other active handles can exit before receiving its bounded result.
     });
   }
 

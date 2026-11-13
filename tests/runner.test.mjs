@@ -8,6 +8,19 @@ import { createRunner } from '../src/runner.mjs';
 import { DaemonLockError } from '../src/core/daemon-lock.mjs';
 import { runMcpStopAction } from '../src/core/mcp-lifecycle.mjs';
 
+// Queue/recovery tests use fake services, so they must not depend on the host's
+// current free memory. Keep the real admission policy and every default budget;
+// inject only the available-memory probe for each independent runner.
+function createTestRunner(options) {
+  return createRunner({
+    ...options,
+    resourcePolicyOptions: {
+      availableMemoryBytes: () => 16 * 1024 ** 3,
+      ...options.resourcePolicyOptions
+    }
+  });
+}
+
 function createFakeRepo(initialOps = [], initialActions = []) {
   const operations = new Map();
   const actions = new Map();
@@ -298,7 +311,7 @@ test('1. daemon lock exclusivity', async () => {
     const repo = createFakeRepo();
     const adapters = createFakeAdapters();
 
-    const runner1 = createRunner({ repo, adapters, dataDir });
+    const runner1 = createTestRunner({ repo, adapters, dataDir });
     await runner1.start();
 
     const status1 = runner1.getStatus();
@@ -306,7 +319,7 @@ test('1. daemon lock exclusivity', async () => {
     assert.equal(status1.locked, true);
 
     // Second runner attempting the same dataDir must be rejected
-    const runner2 = createRunner({ repo, adapters, dataDir });
+    const runner2 = createTestRunner({ repo, adapters, dataDir });
     await assert.rejects(
       async () => await runner2.start(),
       (err) => err instanceof DaemonLockError && err.code === 'LOCK_HELD'
@@ -323,7 +336,7 @@ test('1. daemon lock exclusivity', async () => {
     assert.equal(runner2.getStatus().locked, true);
 
     // Concurrent runner while runner2 is active must be rejected
-    const runnerConcurrent = createRunner({ repo, adapters, dataDir });
+    const runnerConcurrent = createTestRunner({ repo, adapters, dataDir });
     await assert.rejects(
       async () => await runnerConcurrent.start(),
       (err) => err instanceof DaemonLockError && err.code === 'LOCK_HELD'
@@ -335,7 +348,7 @@ test('1. daemon lock exclusivity', async () => {
     const lockFile = path.join(dataDir, 'daemon.lock');
     await fs.writeFile(lockFile, JSON.stringify({ pid: 99999999, nonce: 'stale-test', acquiredAt: '1970-01-01T00:00:00.000Z' }), 'utf8');
 
-    const runner3 = createRunner({ repo, adapters, dataDir });
+    const runner3 = createTestRunner({ repo, adapters, dataDir });
     await runner3.start();
     assert.equal(runner3.getStatus().running, true);
     assert.equal(runner3.getStatus().locked, true);
@@ -368,7 +381,7 @@ test('2. crash recovery on runner start', async () => {
     };
 
     const repo = createFakeRepo([crashedOp]);
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
 
     // Runner start executes crash recovery before accepting new tasks
     await runner.start();
@@ -398,7 +411,7 @@ test('3. notify executes queued operation', async () => {
     const adapters = createFakeAdapters(tracker);
     const repo = createFakeRepo();
 
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
 
     // Enqueue an operation in QUEUED status
@@ -448,7 +461,7 @@ test('4. stop drains cleanly', async () => {
       }
     ]);
 
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
 
     runner.notify();
@@ -469,7 +482,7 @@ test('4. stop drains cleanly', async () => {
     assert.equal(pending.length, 0);
 
     // Verify lock was released and another runner can start cleanly
-    const runnerNext = createRunner({ repo, adapters, dataDir });
+    const runnerNext = createTestRunner({ repo, adapters, dataDir });
     await runnerNext.start();
     assert.equal(runnerNext.getStatus().running, true);
     await runnerNext.stop();
@@ -494,7 +507,7 @@ test('5. stop action draining (QUEUED -> APPLYING -> SUCCEEDED)', async () => {
       }
     ]);
 
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
 
     // Verify initially QUEUED
@@ -552,7 +565,7 @@ test('6. stop action failure recovery / NEEDS_ATTENTION gate', async () => {
     };
 
     const repo = createFakeRepo([], [interruptedAction, failingAction]);
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
 
     // 1. Startup recovery runs: recovers the interrupted action into NEEDS_ATTENTION gate
     await runner.start();
@@ -618,7 +631,7 @@ test('7. unified work queue interleaving switch and stop operations', async () =
     ];
 
     const repo = createFakeRepo(initialOps, initialActions);
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
 
     await runner.start();
     runner.notify();
@@ -687,7 +700,7 @@ test('8. provider release on operation completion', async () => {
     ];
 
     const repo = createFakeRepo(initialOps, initialActions);
-    const runner = createRunner({ repo, adapterProvider, dataDir });
+    const runner = createTestRunner({ repo, adapterProvider, dataDir });
 
     await runner.start();
     runner.notify();
@@ -765,7 +778,7 @@ test('10. runner startup handles synchronous SQLite repo load without Promise .c
       return { ...op };
     };
 
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
     const op = repo.operations.get('op-sync-1');
     assert.equal(op.status, 'ROLLED_BACK');
@@ -799,7 +812,7 @@ test('11. runner startup handles asynchronous injected repo load', async () => {
       }
     ];
     const repo = createFakeRepo(initialOps);
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
     const op = repo.operations.get('op-async-1');
     assert.equal(op.status, 'ROLLED_BACK');
@@ -837,7 +850,7 @@ test('12. stop-loader this binding preserved during runner startup recovery', as
     };
     repo.registry = registry;
 
-    const runner = createRunner({ repo, adapters, dataDir });
+    const runner = createTestRunner({ repo, adapters, dataDir });
     await runner.start();
     const act = repo.actions.get('act-stop-sync-1');
     assert.equal(act.state, 'NEEDS_ATTENTION');
@@ -857,14 +870,14 @@ test('13. failed startup rolls back and releases kernel daemon lock', async () =
         throw failure;
       }
     };
-    const runner = createRunner({ repo, adapters: {}, dataDir });
+    const runner = createTestRunner({ repo, adapters: {}, dataDir });
     await assert.rejects(runner.start(), (err) => err === failure);
     assert.equal(runner.getStatus().started, false);
     assert.equal(runner.getStatus().locked, false);
 
     // Another runner on same dataDir should now be able to acquire lock immediately
     const goodRepo = { getWorkQueue: () => [] };
-    const runner2 = createRunner({ repo: goodRepo, adapters: {}, dataDir });
+    const runner2 = createTestRunner({ repo: goodRepo, adapters: {}, dataDir });
     await runner2.start();
     assert.equal(runner2.getStatus().locked, true);
     await runner2.stop();
@@ -877,12 +890,12 @@ test('14. successful startup retains daemon lease until stop', async () => {
   const dataDir = await createTempDir('runner-retain-lease-');
   try {
     const repo = { getWorkQueue: () => [] };
-    const runner = createRunner({ repo, adapters: {}, dataDir });
+    const runner = createTestRunner({ repo, adapters: {}, dataDir });
     await runner.start();
     assert.equal(runner.getStatus().locked, true);
 
     // Second runner must fail with DaemonLockError while first is active
-    const runner2 = createRunner({ repo, adapters: {}, dataDir });
+    const runner2 = createTestRunner({ repo, adapters: {}, dataDir });
     await assert.rejects(runner2.start(), (err) => err instanceof DaemonLockError || err.name === 'DaemonLockError');
 
     await runner.stop();
@@ -914,7 +927,7 @@ test('15. terminal and attention records produce no dispatch and no spin', async
         throw new Error('not found');
       }
     };
-    const runner = createRunner({ repo, adapters: {}, dataDir });
+    const runner = createTestRunner({ repo, adapters: {}, dataDir });
     await runner.start();
     runner.notify();
     await runner.stop();
@@ -938,7 +951,7 @@ test('16. corrupt/missing load fails closed during startup', async () => {
         return null; // missing record
       }
     };
-    const runner = createRunner({ repo, adapters: {}, dataDir });
+    const runner = createTestRunner({ repo, adapters: {}, dataDir });
     await assert.rejects(runner.start(), (err) => err.code === 'WORK_ITEM_NOT_FOUND' && err.mayMutate === false);
     assert.equal(runner.getStatus().locked, false);
   } finally {
@@ -959,7 +972,7 @@ test('17. lease reacquisition works after failed start', async () => {
         return [];
       }
     };
-    const runner = createRunner({ repo, adapters: {}, dataDir });
+    const runner = createTestRunner({ repo, adapters: {}, dataDir });
     await assert.rejects(runner.start());
     assert.equal(runner.getStatus().locked, false);
 
@@ -989,7 +1002,7 @@ test('18. runner accepts vault and passes it to createRegisteredAdapterProvider'
       return async () => ({});
     };
 
-    const runner = createRunner({
+    const runner = createTestRunner({
       repo,
       adapterProvider: customProvider({ dataDir, vault: fakeVault }),
       vault: fakeVault,
