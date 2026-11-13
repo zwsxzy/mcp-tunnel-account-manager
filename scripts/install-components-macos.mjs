@@ -41,6 +41,21 @@ export function versionAtLeast(actual, minimum) {
   return true;
 }
 
+function parseSemver(value) {
+  const match = value.match(/^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+  if (!match || match[2]?.split('.').some((part) => /^0\d+$/.test(part))) return null;
+  // Build metadata identifies the binary, but does not change its release.
+  // Keep prerelease identifiers: 0.0.20-rc.1 must not match stable 0.0.20.
+  return { version: value, releaseVersion: match[1] };
+}
+
+function parseTunnelVersion(output) {
+  // Validate the entire version token so malformed metadata cannot be silently
+  // truncated to a valid prefix by a permissive substring match.
+  const candidates = output.split(/\s+/).filter((value) => /^v?\d+\./.test(value));
+  return candidates.length === 1 ? parseSemver(candidates[0].replace(/^v/, '')) : null;
+}
+
 export function parseArguments(args) {
   const options = { components: [], force: false, verifyOnly: false };
   for (let i = 0; i < args.length; i += 1) {
@@ -403,10 +418,15 @@ export function createInstaller(overrides = {}) {
     await readJson(path.join(libexec, 'cloudflared-manifest.json'));
     await io.access(binary, fsConstants.X_OK); await io.access(path.join(libexec, 'cloudflared'), fsConstants.X_OK);
     const output = await checked(binary, ['--version'], 'tunnel-client 版本检查', { timeoutMs: 20_000 });
-    const version = output.match(/(?:^|\W)v?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)(?=\W|$)/)?.[1];
-    if (!version) throw new Error(`无法识别 tunnel-client --version 输出：${output}`);
+    const parsedVersion = parseTunnelVersion(output);
+    if (!parsedVersion) throw new Error(`无法识别 tunnel-client --version 输出：${output}`);
+    const { version, releaseVersion } = parsedVersion;
     const brewVersions = await checked(tools.brew, ['list', '--versions', sources.tunnelFormula], '读取 Homebrew 已安装版本');
-    if (!brewVersions.split(/\s+/).slice(1).some((value) => value === version || value.startsWith(`${version}_`))) throw new Error(`tunnel-client 运行版本 ${version} 与 Homebrew 记录不符：${brewVersions}`);
+    const matchesFormula = brewVersions.split(/\s+/).slice(1).some((value) => {
+      const formulaVersion = parseSemver(value.replace(/_(?:0|[1-9]\d*)$/, ''));
+      return formulaVersion?.releaseVersion === releaseVersion;
+    });
+    if (!matchesFormula) throw new Error(`tunnel-client 运行版本 ${version} 与 Homebrew 记录不符：${brewVersions}`);
     const current = await stat(locations.tunnelBinary);
     const targetMatches = current?.isSymbolicLink() && await io.readlink(locations.tunnelBinary) === binary;
     if (options.verifyOnly) {

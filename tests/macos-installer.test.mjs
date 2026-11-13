@@ -15,6 +15,7 @@ const probe = spawnSync('python3', ['-c', 'import sys,venv;print(sys.executable)
 const python = probe.status === 0 ? probe.stdout.trim() : null;
 const requiresPosixPython = { skip: process.platform === 'win32' || !python ? 'These isolated POSIX venv fixtures need python3; they are not macOS hardware claims.' : false };
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+const officialTunnelVersion = '0.0.20+c2144b0904980bcbae2636cdca4f4167e9818e0b';
 
 async function write(file, content, mode = 0o600) {
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -86,13 +87,13 @@ async function fixture(t, changes = {}) {
     calls.push({ executable, args: [...args], cwd: options.cwd });
     if (executable === brew) {
       if (args[0] === '--version') return { code: 0, stdout: 'Homebrew fixture\n', stderr: '' };
-      if (args[0] === 'list') return { code: status.brewInstalled ? 0 : 1, stdout: status.brewInstalled ? 'tunnel-client 0.0.20\n' : '', stderr: '' };
+      if (args[0] === 'list') return { code: status.brewInstalled ? 0 : 1, stdout: status.brewInstalled ? (status.brewVersions ?? 'tunnel-client 0.0.20\n') : '', stderr: '' };
       if (['install', 'reinstall'].includes(args[0])) { status.brewInstalled = true; return { code: 0, stdout: '', stderr: '' }; }
       if (args[0] === '--prefix') return { code: 0, stdout: `${brewPrefix}\n`, stderr: '' };
       throw new Error(`Unexpected Homebrew fixture call: ${JSON.stringify(args)}`);
     }
     if (executable === git) return { code: 0, stdout: 'git version fixture\n', stderr: '' };
-    if (executable === path.join(brewPrefix, 'libexec', 'tunnel-client')) return { code: 0, stdout: 'tunnel-client v0.0.20\n', stderr: '' };
+    if (executable === path.join(brewPrefix, 'libexec', 'tunnel-client')) return { code: 0, stdout: status.tunnelVersionOutput ?? 'tunnel-client v0.0.20\n', stderr: '' };
     if (executable === npm) {
       if (args[0] === '--version') return { code: 0, stdout: '11.4.0\n', stderr: '' };
       assert.ok(args.includes('--ignore-scripts'));
@@ -199,6 +200,53 @@ test('isolated POSIX fixture installs all components in a Unicode, space and quo
   assert.equal(second.code, 0, f.logs.join('\n'));
 });
 
+test('official Homebrew build metadata matches its release and remains in the installation record', requiresPosixPython, async (t) => {
+  const output = `tunnel-client version ${officialTunnelVersion}\n`;
+  const f = await fixture(t, { tunnelVersionOutput: output });
+  const installed = await f.execute({ components: ['tunnel-client'] });
+  assert.equal(installed.code, 0, f.logs.join('\n'));
+  assert.equal(installed.results[0].version, officialTunnelVersion);
+  assert.equal(installed.results[0].versionOutput, output.trim());
+  const state = JSON.parse(await fs.readFile(path.join(f.home, '.mcp-tunnel-kit', 'install-state-macos.json')));
+  assert.equal(state.components['tunnel-client'].version, officialTunnelVersion);
+  assert.equal(state.components['tunnel-client'].versionOutput, output.trim());
+  assert.equal(state.components['tunnel-client'].brewVersions, 'tunnel-client 0.0.20');
+  assert.ok(f.logs.some((line) => line.includes(`[OK] tunnel-client ${officialTunnelVersion}`)));
+});
+
+test('Homebrew matching preserves release and prerelease identity while accepting formula revisions', requiresPosixPython, async (t) => {
+  const cases = [
+    ['0.0.20+001.build-7', '0.0.20_1', true],
+    ['0.0.20-rc.1+build.7', '0.0.20-rc.1', true],
+    ['0.0.19+build.7', '0.0.20', false],
+    ['0.0.21+build.7', '0.0.20', false],
+    ['0.0.20-rc.1+build.7', '0.0.20', false],
+    ['0.0.20+build.7', '0.0.20-rc.1', false],
+    ['0.0.20-rc.2+build.7', '0.0.20-rc.1', false],
+  ];
+  for (const [version, formulaVersion, expected] of cases) {
+    const f = await fixture(t, { tunnelVersionOutput: `tunnel-client v${version}\n`, brewVersions: `tunnel-client ${formulaVersion}\n` });
+    const outcome = await f.execute({ components: ['tunnel-client'] });
+    assert.equal(outcome.ok, expected, `${version} vs ${formulaVersion}: ${f.logs.join('\n')}`);
+    if (expected) assert.equal(outcome.results[0].version, version);
+    else {
+      assert.match(outcome.results[0].error, /与 Homebrew 记录不符/);
+      assert.equal(await exists(outcome.locations.tunnelBinary), false);
+    }
+  }
+});
+
+test('malformed SemVer metadata cannot be truncated into an accepted tunnel-client release', requiresPosixPython, async (t) => {
+  const f = await fixture(t);
+  for (const version of ['0.0.20+', '0.0.20+build..7', '0.0.20+.build', '0.0.20+build.', '0.0.20+build_7', '0.0.20+build+7', '0.0.20+build!', '0.0.20+构建', '00.0.20+build', '0.0.20-01+build']) {
+    f.status.tunnelVersionOutput = `tunnel-client v${version}\n`;
+    const outcome = await f.execute({ components: ['tunnel-client'] });
+    assert.equal(outcome.code, 1, version);
+    assert.match(outcome.results[0].error, /无法识别 tunnel-client --version 输出/);
+    assert.equal(await exists(outcome.locations.tunnelBinary), false);
+  }
+});
+
 test('repeat install reuses components; force preserves personal files and settings', requiresPosixPython, async (t) => {
   const f = await fixture(t);
   const first = await f.execute();
@@ -254,7 +302,7 @@ test('broken existing YAML produces a nonzero result without overwriting credent
 });
 
 test('verify-only has no filesystem mutations or install/download commands', requiresPosixPython, async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { tunnelVersionOutput: `tunnel-client version ${officialTunnelVersion}\n` });
   assert.equal((await f.execute()).code, 0, f.logs.join('\n'));
   const before = await snapshot(f.home);
   f.calls.length = 0; f.downloads.length = 0;

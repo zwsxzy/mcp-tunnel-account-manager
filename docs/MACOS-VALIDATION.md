@@ -31,8 +31,8 @@ under `/tmp`; tests clean those endpoints after use. They are not publishable ar
 ### Local complete-unit result, 2026-11-13
 
 The complete default unit run on Linux / Node.js 24.22.1 passed **68 of 68 files**
-(65 light, 3 heavy), with **0 failed files**, exit code **0**, in **18.506 seconds**.
-The report is `artifacts/mac-port-20261113/unit-native-exit-fix/report.json`; the full output
+(65 light, 3 heavy), with **0 failed files**, exit code **0**, in **18.263 seconds**.
+The report is `artifacts/mac-port-20261113/unit-install-fix/report.json`; the full output
 is alongside it as `full-unit.log`. Platform skips described below are explicit.
 This is local evidence; native macOS results must be read from Actions.
 
