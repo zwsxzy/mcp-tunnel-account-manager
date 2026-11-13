@@ -19,11 +19,15 @@ function identity(ctx) {
   const i = ctx.identity;
   const pid = i.pid;
   const date = Date.parse(i.startedAt);
+  const executable = i.executablePath;
+  const windowsPath = typeof executable === 'string' && /^[A-Za-z]:[\\/]|^\\\\/.test(executable);
+  const pathApi = windowsPath ? path.win32 : path.posix;
   if (i.verified !== true || !Number.isInteger(pid) || pid <= 0 ||
-      !Number.isFinite(date) || typeof i.executablePath !== 'string' ||
-      !path.win32.isAbsolute(i.executablePath)) fail('PROCESS_IDENTITY_UNVERIFIED');
+      !Number.isFinite(date) || typeof executable !== 'string' || executable.includes('\0') ||
+      !pathApi.isAbsolute(executable)) fail('PROCESS_IDENTITY_UNVERIFIED');
+  const normalized = pathApi.normalize(executable);
   return { pid, startedAt: new Date(date).toISOString(),
-    executablePath: path.win32.normalize(i.executablePath).toLowerCase() };
+    executablePath: windowsPath ? normalized.toLowerCase() : normalized };
 }
 
 function claims(ctx) {

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createMcpRoutes, publishMcpDto } from './http/mcp-routes.mjs';
 import { createInstanceRoutes } from './http/instance-routes.mjs';
 import { decideRecoveryAcknowledgement } from './core/recovery-acknowledgement.mjs';
+import { stopManagedTunnels } from './core/stop-managed-tunnels.mjs';
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 
@@ -323,9 +324,9 @@ export function createHttpServer({
   locations,
   vault,
   dataDir,
-  // Injectable lifecycle of the OS process table. Production omits it and keeps
-  // the taskkill/tasklist behaviour; tests pass fakes so the stop-all job can be
-  // exercised without touching a real tunnel-client.
+  // Explicit Windows helper injection is retained for its existing contract tests.
+  // POSIX production stops only authenticated, console-owned instances.
+  platform = process.platform,
   tunnelClientOps = null
 } = {}) {
   if (!security || typeof security !== 'object' || typeof security.guard !== 'function') {
@@ -358,6 +359,7 @@ export function createHttpServer({
    */
   const stopAllJobs = new Map();
   const STOP_ALL_JOB_TTL_MS = 5 * 60 * 1000;
+  const useManagedStop = platform !== 'win32' && !tunnelClientOps;
 
   const defaultTaskkill = () => new Promise((resolve) => {
     execFile('taskkill', ['/IM', 'tunnel-client.exe', '/F'], { windowsHide: true }, (err, stdout, stderr) => {
@@ -388,7 +390,7 @@ export function createHttpServer({
     ? () => tunnelClientOps.listPids()
     : defaultListPids;
 
-  async function runStopAllJob(job) {
+  async function performStopAllJob(job) {
     const bump = (percent, message) => {
       job.percent = Math.max(0, Math.min(100, percent));
       job.message = message;
@@ -401,7 +403,9 @@ export function createHttpServer({
       // "0 条记录", after which every instance was reported stopped and every
       // pointer cleared while the tunnels were still running.
       bump(10, '正在统计账号隧道…');
-      const services = ['overleaf-mcp', 'antigravity-mcp', 'mcp_dsh_chatgpt_bridge'];
+      const services = useManagedStop
+        ? [...new Set(['overleaf-mcp', 'antigravity-mcp', ...Object.keys(adapters || {})])]
+        : ['overleaf-mcp', 'antigravity-mcp', 'mcp_dsh_chatgpt_bridge'];
       if (typeof repo?.listServices === 'function') {
         try {
           const all = await repo.listServices();
@@ -418,6 +422,7 @@ export function createHttpServer({
         : (typeof repo?.getObserver === 'function' ? repo.getObserver() : null);
 
       const known = [];
+      const instanceTargets = [];
       for (const sid of services) {
         try {
           if (typeof repo?.listInstanceRuntimes !== 'function') {
@@ -426,7 +431,10 @@ export function createHttpServer({
           }
           for (const row of (repo.listInstanceRuntimes(sid) || [])) {
             const iid = row?.instanceId || row?.instance_id;
-            if (iid) known.push(iid);
+            if (iid) {
+              known.push(iid);
+              instanceTargets.push({ serviceId: sid, instanceId: iid, profileId: row.profileId || row.profile_id });
+            }
           }
         } catch (err) {
           enumerationErrors.push({ scope: 'instances', target: sid, message: String(err?.message || err) });
@@ -439,6 +447,15 @@ export function createHttpServer({
       const killedPidSet = new Set();
       let alive = [];
       let absenceUnconfirmed = null;
+      let remainingPids = [];
+      if (useManagedStop) {
+        const stopped = await stopManagedTunnels({ services, instances: instanceTargets,
+          adapters, adapterProvider, instanceAdapterProvider, repo, onProgress: bump });
+        for (const pid of stopped.killedPids) killedPidSet.add(pid);
+        remainingPids = stopped.remainingPids;
+        absenceUnconfirmed = stopped.absenceUnconfirmed;
+        enumerationErrors.push(...stopped.errors);
+      } else {
       for (let attempt = 0; attempt < 4; attempt++) {
         let killed = null;
         try {
@@ -458,7 +475,6 @@ export function createHttpServer({
         if (alive.length === 0) break;
         await new Promise((r) => setTimeout(r, 400));
       }
-      let remainingPids = [];
       if (!absenceUnconfirmed) {
         try {
           remainingPids = await listTunnelClientPids();
@@ -467,7 +483,10 @@ export function createHttpServer({
           enumerationErrors.push({ scope: 'listPids', message: absenceUnconfirmed });
         }
       }
-      bump(90, remainingPids.length ? `仍有 ${remainingPids.length} 个残留，正在收尾` : '进程已全部终止，正在更新状态');
+      }
+      if (enumerationErrors.length && !absenceUnconfirmed) absenceUnconfirmed = '部分进程或账号记录读取失败';
+      bump(90, absenceUnconfirmed ? '部分进程状态未确认，正在保留原状态'
+        : remainingPids.length ? `仍有 ${remainingPids.length} 个残留，正在收尾` : '退出已确认，正在更新状态');
 
       // 3. Converge stored state -- ONLY on confirmed, complete absence.
       //    Partial or unverified runs leave every claim exactly as observed.
@@ -490,17 +509,23 @@ export function createHttpServer({
       //    instance write must not leave the gate stuck open.
       let clearedActions = 0;
       let clearedOperations = 0;
+      let recoveryReset = false;
       try {
-        if (typeof repo?.clearRecoveryState === 'function') {
+        if (useManagedStop && !confirmedAbsent) {
+          // An unconfirmed stop cannot authorize discarding recovery evidence.
+        } else if (typeof repo?.clearRecoveryState === 'function') {
           const cleared = await repo.clearRecoveryState();
           clearedActions = cleared?.clearedActions || 0;
           clearedOperations = cleared?.clearedOperations || 0;
+          recoveryReset = true;
         } else if (typeof repo?.resetRecoveryGate === 'function') {
           repo.resetRecoveryGate();
+          recoveryReset = true;
         }
       } catch (_) {}
 
       job.result = {
+        scope: useManagedStop ? 'managed' : 'machine',
         killed: killedPidSet.size,
         killedPids: [...killedPidSet],
         remaining: remainingPids.length,
@@ -513,21 +538,43 @@ export function createHttpServer({
         writeErrors,
         absenceUnconfirmed,
         clearedActions,
-        clearedOperations
+        clearedOperations,
+        recoveryReset
       };
-      const gateNote = (clearedActions + clearedOperations) > 0
+      const gateNote = !recoveryReset ? '' : (clearedActions + clearedOperations) > 0
         ? `，并复位恢复闸门（清理 ${clearedActions} 条待处理动作）`
         : '，并复位恢复闸门';
       const skipNote = confirmedAbsent ? '' : '；进程缺席未确认，已保留原状态';
-      bump(100, remainingPids.length
+      bump(100, absenceUnconfirmed
+        ? `关闭未完成：${absenceUnconfirmed}；已保留原状态`
+        : remainingPids.length
         ? `已终止 ${killedPidSet.size} 个，仍有 ${remainingPids.length} 个未关闭`
-        : `已关闭全部 ${killedPidSet.size} 个 tunnel-client 进程${gateNote}${skipNote}`);
+        : `已关闭 ${killedPidSet.size} 个${useManagedStop ? '本控制台管理的 ' : ''}tunnel-client 进程${gateNote}${skipNote}`);
       job.done = true;
       // Success requires: nothing left alive, a complete enumeration, no failed
       // write, and no unconfirmed absence. Anything else is reported honestly.
       job.ok = confirmedAbsent && writeErrors.length === 0;
     } catch (err) {
       job.error = String(err?.message || err);
+      job.done = true;
+      job.ok = false;
+    }
+  }
+
+  async function runStopAllJob(job) {
+    if (!useManagedStop) return performStopAllJob(job);
+    try {
+      if (typeof runner?.deps?.withExclusiveLock !== 'function') {
+        throw new Error('PROCESS_LIFECYCLE_LOCK_UNAVAILABLE');
+      }
+      // Use the same admission chain as account switches and instance actions.
+      // Enumeration, exit verification and stored-state convergence are one
+      // critical section; no queued launch may interleave with finalization.
+      await runner.deps.withExclusiveLock(() => performStopAllJob(job));
+    } catch (error) {
+      job.error = String(error?.code || error?.message || error);
+      job.message = '未能取得生命周期锁，关闭任务未执行';
+      job.updatedAt = Date.now();
       job.done = true;
       job.ok = false;
     }

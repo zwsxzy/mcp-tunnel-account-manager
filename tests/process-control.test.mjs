@@ -1,10 +1,16 @@
-import test from 'node:test';
+import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+
+// These are real Win32/CIM/PowerShell handle tests. macOS uses the independently
+// executed POSIX lifecycle suite; portable contracts are never skipped here.
+const test = (name, fn) => nodeTest(name, {
+  skip: process.platform !== 'win32' ? 'Windows native process API; exercised by the Windows CI job' : false
+}, fn);
 
 const scriptPath = fileURLToPath(new URL('../scripts/process-control.ps1', import.meta.url));
 const keepAliveFixture = fileURLToPath(new URL('./fixtures/keep-alive.cjs', import.meta.url));

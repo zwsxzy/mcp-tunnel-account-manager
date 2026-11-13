@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { resolvePlatformPaths } from '../core/platform-paths.mjs';
 
 const ALLOWED_ROLES = Object.freeze([
   'sourceConfig',
@@ -21,12 +22,18 @@ export function createMcpLocationResolver(options = {}) {
     storePath,
     stat: customStat,
     realpath: customRealpath,
-    revealDirectory: customRevealDirectory
+    revealDirectory: customRevealDirectory,
+    spawn: customSpawn,
+    platform = process.platform,
+    env = process.env,
+    home
   } = options;
 
   const statFn = customStat || (async (p) => fs.promises.stat(p));
   const realpathFn = customRealpath || (async (p) => fs.promises.realpath(p));
   const revealDirectoryFn = customRevealDirectory;
+  const spawnFn = customSpawn || spawn;
+  const defaults = resolvePlatformPaths({ platform, env, home });
 
   async function checkExists(targetPath) {
     if (!targetPath || targetPath === 'unknown' || typeof targetPath !== 'string') return false;
@@ -52,10 +59,10 @@ export function createMcpLocationResolver(options = {}) {
     if (cmd.includes('/') || cmd.includes('\\') || path.isAbsolute(cmd)) return null;
     if (/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(cmd)) return null;
 
-    const pathEnv = process.env.PATH || process.env.Path || '';
-    const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+    const pathEnv = env.PATH || env.Path || '';
+    const dirs = pathEnv.split(platform === 'win32' ? ';' : ':').filter(Boolean);
     const hasExt = Boolean(path.extname(cmd));
-    const exts = process.platform === 'win32' && !hasExt
+    const exts = platform === 'win32' && !hasExt
       ? ['.exe', '.cmd', '.bat', '']
       : [''];
 
@@ -86,14 +93,14 @@ export function createMcpLocationResolver(options = {}) {
     const isHttp = def.binding?.type === 'http';
     let sourceConfigPath = def.locations?.sourceConfigPath || def.provenance?.sourceConfigPath || null;
     if (!sourceConfigPath && def.locations?.sourceConfigPath !== null) {
-      if (def.id === 'antigravity-mcp' && process.env.APPDATA) {
-        const defaultYaml = path.join(process.env.APPDATA, 'tunnel-client', 'antigravity-local.yaml');
+      if (def.id === 'antigravity-mcp') {
+        const defaultYaml = path.join(defaults.tunnelConfigDir, 'antigravity-local.yaml');
         if (await checkExists(defaultYaml)) sourceConfigPath = defaultYaml;
-      } else if (def.id === 'overleaf-mcp' && process.env.APPDATA) {
-        const defaultYaml = path.join(process.env.APPDATA, 'tunnel-client', 'overleaf.yaml');
+      } else if (def.id === 'overleaf-mcp') {
+        const defaultYaml = path.join(defaults.tunnelConfigDir, 'overleaf.yaml');
         if (await checkExists(defaultYaml)) sourceConfigPath = defaultYaml;
-      } else if (def.id === 'mcp_dsh_chatgpt_bridge' && process.env.USERPROFILE) {
-        const defaultYaml = path.join(process.env.USERPROFILE, '.dsh', 'chatgpt-bridge', 'tunnel', 'dsh-bridge.yaml');
+      } else if (def.id === 'mcp_dsh_chatgpt_bridge') {
+        const defaultYaml = path.join(defaults.userProfile, '.dsh', 'chatgpt-bridge', 'tunnel', 'dsh-bridge.yaml');
         if (await checkExists(defaultYaml)) sourceConfigPath = defaultYaml;
       }
     }
@@ -143,7 +150,7 @@ export function createMcpLocationResolver(options = {}) {
           }
         }
         if (cwd) candidatesToProbe.push(cwd);
-        if (executable && !executable.includes(' ')) {
+        if (executable) {
           const exeDir = path.dirname(executable);
           if (exeDir && exeDir !== '.') candidatesToProbe.push(exeDir);
         }
@@ -160,7 +167,7 @@ export function createMcpLocationResolver(options = {}) {
         }
 
         // Probe Python environment root if executable resides in Scripts/bin directory
-        if (!installationRoot && executable && !executable.includes(' ')) {
+        if (!installationRoot && executable) {
           const exeDir = path.dirname(executable);
           const dirName = path.basename(exeDir).toLowerCase();
           if (dirName === 'scripts' || dirName === 'bin') {
@@ -342,13 +349,33 @@ export function createMcpLocationResolver(options = {}) {
     if (typeof revealDirectoryFn === 'function') {
       await revealDirectoryFn(canonicalDir);
     } else {
-      if (process.platform === 'win32') {
-        const child = spawn('explorer.exe', [canonicalDir], {
-          detached: true,
-          stdio: 'ignore'
-        });
-        child.unref();
+      if (platform !== 'win32' && platform !== 'darwin') {
+        const error = new Error('Opening a directory is not supported on this platform');
+        error.code = 'REVEAL_UNSUPPORTED';
+        error.status = error.statusCode = 501;
+        throw error;
       }
+      await new Promise((resolve, reject) => {
+        const child = spawnFn(platform === 'darwin' ? '/usr/bin/open' : 'explorer.exe', [canonicalDir], {
+          detached: platform === 'win32',
+          stdio: 'ignore',
+          shell: false
+        });
+        child.once('error', reject);
+        if (platform === 'win32') {
+          child.once('spawn', () => { child.unref(); resolve(); });
+        } else {
+          child.once('close', code => {
+            if (code === 0) resolve();
+            else {
+              const error = new Error('The system could not open the directory');
+              error.code = 'REVEAL_FAILED';
+              error.status = error.statusCode = 500;
+              reject(error);
+            }
+          });
+        }
+      });
     }
 
     return {

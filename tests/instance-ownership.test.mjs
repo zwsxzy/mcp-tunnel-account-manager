@@ -263,11 +263,18 @@ test('colliding profile ids cannot rebind an existing instance row (would strand
 });
 
 test('the instance provider refuses production data directories', async (t) => {
-  const { paths, vault } = createLifecycleWorkspace(t);
-  const prodData = path.resolve(process.env.LOCALAPPDATA || 'C:\nonexistent', 'McpTunnelAccountManager');
+  const { dataDir, paths, vault } = createLifecycleWorkspace(t);
+  const savedLocalAppData = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = path.join(path.dirname(dataDir), 'production-local');
+  t.after(() => {
+    if (savedLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = savedLocalAppData;
+  });
+  const prodData = path.join(process.env.LOCALAPPDATA, 'McpTunnelAccountManager');
 
   assert.throws(
     () => createInstanceAdapterProvider({ dataDir: prodData, vault, paths }),
+    { code: 'INVALID_INSTANCE' },
     'instances must never be written next to the production database'
   );
 });

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -33,7 +34,7 @@ export function getLaunchOptions(env = process.env, root = projectRoot) {
 export async function run() {
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 14)) {
-    throw new Error('Node.js >= 22.14.0 is required. Use the included Windows x64 runtime.');
+    throw new Error('Node.js >= 22.14.0 is required. Install a supported Node.js version from https://nodejs.org/.');
   }
   const { startManager } = await import('../src/main.mjs');
   const manager = await startManager(getLaunchOptions());
@@ -41,6 +42,11 @@ export async function run() {
   console.log(`MCP Tunnel Account Manager listening on ${manager.url}`);
   console.log(`Local data directory: ${manager.dataDir}`);
   console.log('First run: read bootstrap-code.txt in the local data directory; do not share it.');
+  if (process.platform === 'darwin' && process.env.MCP_OPEN_BROWSER === '1') {
+    const browser = spawn('/usr/bin/open', [manager.url], { stdio: 'ignore' });
+    browser.once('error', () => console.warn('无法自动打开浏览器，请手动访问上方本地地址。'));
+    browser.unref();
+  }
   let stopping = false;
   const stop = async () => {
     if (stopping) return;

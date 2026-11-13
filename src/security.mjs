@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { ensurePrivateDirectory, securePrivateFile } from './vault.mjs';
 
 export class SecurityError extends Error {
   constructor(code, status, message) {
@@ -184,10 +185,13 @@ export function createSecurity({ dataDir, allowedOrigin }) {
     throw new Error('dataDir is required');
   }
 
-  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(dataDir);
   const authPath = path.join(dataDir, 'auth.json');
   const bootstrapPath = path.join(dataDir, 'bootstrap-code.txt');
   const legacyBootstrapPath = path.join(dataDir, 'bootstrap.secret');
+  for (const privatePath of [authPath, bootstrapPath, legacyBootstrapPath]) {
+    securePrivateFile(privatePath, { allowMissing: true });
+  }
 
   let configured = fs.existsSync(authPath);
   let currentBootstrapCode = null;
@@ -274,6 +278,7 @@ export function createSecurity({ dataDir, allowedOrigin }) {
     };
 
     fs.writeFileSync(authPath, JSON.stringify(authRecord, null, 2), { encoding: 'utf8', mode: 0o600 });
+    securePrivateFile(authPath);
     configured = true;
 
     return { ok: true };

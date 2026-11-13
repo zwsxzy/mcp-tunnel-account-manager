@@ -551,8 +551,9 @@ test('6. proxy, child env pinning and MCP environment preservation', async () =>
   assert.equal(launched.env.ALL_PROXY, DEFAULT_PROXY);
 
   // 3. Command arguments contain proxy flag and NO plaintext api key
-  assert.ok(launched.args.includes('--http-proxy'));
-  assert.ok(launched.args.includes(DEFAULT_PROXY));
+  assert.equal(launched.args.includes('--http-proxy'), Boolean(DEFAULT_PROXY));
+  if (DEFAULT_PROXY) assert.ok(launched.args.includes(DEFAULT_PROXY));
+  else assert.equal(launched.args.includes(''), false, 'direct launch must not emit an empty proxy argument');
   for (const arg of launched.args) {
     assert.ok(!arg.includes(testApiKey), 'API key must never be exposed in command line arguments');
   }
@@ -1139,7 +1140,7 @@ test('22. Upstream tunnel-client 0.0.19 bindingToTunnelCommand formatting', () =
     ]
   };
 
-  const cmd = bindingToTunnelCommand(binding);
+  const cmd = bindingToTunnelCommand(binding, { platform: 'win32' });
   assert.equal(cmd.executable, 'node');
   assert.equal(cmd.args.length, 3);
   // Parsing command line reproduces args
@@ -2097,7 +2098,7 @@ test('production Windows launch uses an inheritable hidden native console and ne
   // that it stays hidden with piped stdio and never inherits the console.
   assert.match(source, /spawnHelper = spawn\b/);
   assert.match(source, /spawnHelper\('powershell', args,\s*\{\s*stdio:\s*\['ignore',\s*'pipe',\s*'pipe'\],\s*windowsHide:\s*true/s);
-  assert.match(source, /if \(process.platform === 'win32'\) \{\s*const payload = \{[^}]+hiddenConsole: true/s);
+  assert.match(source, /if \(platform === 'win32' \|\| psWorkerPool\) \{\s*const payload = \{[^}]+hiddenConsole: true/s);
   assert.match(source, /executeHelper\('Launch', \{ LaunchPayload: payload, service \}\)/);
   assert.match(source, /if \(action === 'Launch'\) \{\s*throw new SwitchFault\('PROCESS_LAUNCH_UNCONFIRMED'/);
   assert.match(native, /uint flags = hiddenConsole \? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW/);

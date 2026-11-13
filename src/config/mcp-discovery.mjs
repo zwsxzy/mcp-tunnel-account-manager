@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { resolvePlatformPaths } from '../core/platform-paths.mjs';
 import { discoveryIdentity, isMcpServiceId, LEGACY_SERVICES } from '../core/mcp-registry-policy.mjs';
-import { publicBinding as formatPublicBinding } from '../adapters/mcp-binding.mjs';
+import { publicBinding as formatPublicBinding, parseWindowsCommandLine, parsePosixCommandLine } from '../adapters/mcp-binding.mjs';
 import {
   classifyTxtConfig,
   parseLiteralTxtConfig,
@@ -51,36 +52,8 @@ export function isSensitiveValue(val) {
  * Tokenizes a command line string into [executable, ...args]
  * respecting double and single quotes without shell execution.
  */
-export function tokenizeCommandLine(str) {
-  if (!str || typeof str !== 'string') return [];
-  const tokens = [];
-  let current = '';
-  let inQuotes = false;
-  let quoteChar = '';
-
-  for (let i = 0; i < str.length; i++) {
-    const char = str[i];
-    if ((char === '"' || char === "'") && (!inQuotes || quoteChar === char)) {
-      if (inQuotes) {
-        inQuotes = false;
-        quoteChar = '';
-      } else {
-        inQuotes = true;
-        quoteChar = char;
-      }
-    } else if (char === ' ' && !inQuotes) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = '';
-      }
-    } else {
-      current += char;
-    }
-  }
-  if (current.length > 0) {
-    tokens.push(current);
-  }
-  return tokens;
+export function tokenizeCommandLine(str, { platform = process.platform } = {}) {
+  return platform === 'win32' ? parseWindowsCommandLine(str) : parsePosixCommandLine(str);
 }
 
 /**
@@ -238,9 +211,12 @@ export function parseRestrictedYaml(content) {
       const n = parseFloat(val);
       if (Number.isFinite(n)) return n;
     }
-    if ((val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
-        (val.startsWith("'") && val.endsWith("'") && val.length >= 2)) {
-      return val.slice(1, -1);
+    if (val.startsWith("'") && val.endsWith("'") && val.length >= 2) {
+      return val.slice(1, -1).replaceAll("''", "'");
+    }
+    if (val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
+      // JSON string encoding is a YAML subset and is used by our profile writer.
+      try { return JSON.parse(val); } catch { return val.slice(1, -1); }
     }
     return val;
   }
@@ -255,12 +231,20 @@ export function parseRestrictedYaml(content) {
     let trimmed = rawLine.slice(indent);
 
     // Strip comments not inside quotes
-    const hashIdx = trimmed.indexOf('#');
-    if (hashIdx !== -1) {
-      const beforeHash = trimmed.slice(0, hashIdx);
-      const quoteCount = (beforeHash.match(/["']/g) || []).length;
-      if (quoteCount % 2 === 0) {
-        trimmed = beforeHash.trimEnd();
+    let scalarQuote = null;
+    for (let j = 0; j < trimmed.length; j += 1) {
+      const char = trimmed[j];
+      if (scalarQuote === "'") {
+        if (char === "'" && trimmed[j + 1] === "'") j += 1;
+        else if (char === "'") scalarQuote = null;
+      } else if (scalarQuote === '"') {
+        if (char === '\\') j += 1;
+        else if (char === '"') scalarQuote = null;
+      } else if (char === "'" || char === '"') {
+        scalarQuote = char;
+      } else if (char === '#' && (j === 0 || /\s/.test(trimmed[j - 1]))) {
+        trimmed = trimmed.slice(0, j).trimEnd();
+        break;
       }
     }
     if (!trimmed) continue;
@@ -373,7 +357,10 @@ export function createMcpDiscovery(options = {}) {
     maxBytes = 512 * 1024, // 512 KB
     dataDir,
     vault,
-    repo
+    repo,
+    platform = process.platform,
+    env = process.env,
+    home
   } = options;
 
   const readFileFn = customReadFile || (async (p) => fs.promises.readFile(p, 'utf8'));
@@ -398,13 +385,13 @@ export function createMcpDiscovery(options = {}) {
   let inventoryList = [];
 
   async function getDefaultSources() {
-    const appData = process.env.APPDATA || (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming') : '');
-    const userProfile = process.env.USERPROFILE || '';
+    const { appData, userProfile, tunnelConfigDir, tunnelHome } = resolvePlatformPaths({ platform, env, home });
     const defs = [];
     const seenPaths = new Set();
 
     function addDef(item) {
-      const norm = path.resolve(item.path).toLowerCase();
+      const resolved = path.resolve(item.path);
+      const norm = platform === 'win32' ? resolved.toLowerCase() : resolved;
       if (!seenPaths.has(norm)) {
         seenPaths.add(norm);
         defs.push(item);
@@ -413,19 +400,21 @@ export function createMcpDiscovery(options = {}) {
 
     // 1. Fixed authorized legacy sources
     if (appData) {
-      addDef({ path: path.join(appData, 'tunnel-client', 'antigravity-local.yaml'), kind: 'yaml', serviceId: 'antigravity-mcp', label: 'Antigravity MCP' });
-      addDef({ path: path.join(appData, 'tunnel-client', 'overleaf.yaml'), kind: 'yaml', serviceId: 'overleaf-mcp', label: 'Overleaf MCP' });
+      addDef({ path: path.join(tunnelConfigDir, 'antigravity-local.yaml'), kind: 'yaml', serviceId: 'antigravity-mcp', label: 'Antigravity MCP' });
+      addDef({ path: path.join(tunnelConfigDir, 'overleaf.yaml'), kind: 'yaml', serviceId: 'overleaf-mcp', label: 'Overleaf MCP' });
     }
     if (userProfile) {
-      addDef({ path: path.join(userProfile, '.openai-tunnel', 'tunnel.env'), kind: 'dotenv' });
-      addDef({ path: path.join(userProfile, '.openai-tunnel', 'start-overleaf-tunnel.bat'), kind: 'bat', serviceId: 'overleaf-mcp', label: 'Overleaf MCP' });
-      addDef({ path: path.join(userProfile, '.openai-tunnel', 'start-antigravity-tunnel.bat'), kind: 'bat', serviceId: 'antigravity-mcp', label: 'Antigravity MCP' });
+      addDef({ path: path.join(tunnelHome, 'tunnel.env'), kind: 'dotenv' });
+      if (platform === 'win32' || env.USERPROFILE || env.APPDATA) {
+        addDef({ path: path.join(tunnelHome, 'start-overleaf-tunnel.bat'), kind: 'bat', serviceId: 'overleaf-mcp', label: 'Overleaf MCP' });
+        addDef({ path: path.join(tunnelHome, 'start-antigravity-tunnel.bat'), kind: 'bat', serviceId: 'antigravity-mcp', label: 'Antigravity MCP' });
+      }
     }
 
     // 2. Expand ONLY authorized roots (%APPDATA%/tunnel-client and %USERPROFILE%/.openai-tunnel) for top-level config files
     const authorizedRoots = [];
-    if (appData) authorizedRoots.push(path.join(appData, 'tunnel-client'));
-    if (userProfile) authorizedRoots.push(path.join(userProfile, '.openai-tunnel'));
+    if (appData) authorizedRoots.push(tunnelConfigDir);
+    if (userProfile) authorizedRoots.push(tunnelHome);
 
     const ALLOWED_EXTS = new Set(['.txt', '.json', '.yaml', '.yml', '.env', '.bat', '.cmd']);
     const EXCLUDED_NAMES = /^(?:tests|fixtures|\.git|node_modules|\.gpt.*|reports|build)$/i;
@@ -441,7 +430,12 @@ export function createMcpDiscovery(options = {}) {
           if (entry.isSymbolicLink()) {
             try {
               const real = await realpathFn(path.join(root, entry.name));
-              if (!real.toLowerCase().startsWith(path.resolve(root).toLowerCase())) {
+              const rootReal = await realpathFn(root);
+              const relative = path.relative(
+                platform === 'win32' ? rootReal.toLowerCase() : rootReal,
+                platform === 'win32' ? real.toLowerCase() : real
+              );
+              if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
                 continue;
               }
             } catch {
@@ -713,7 +707,9 @@ export function createMcpDiscovery(options = {}) {
 
     const cmdStr = parsed.mcp?.commands?.[0]?.command || parsed.server?.command || null;
     if (cmdStr && typeof cmdStr === 'string') {
-      const tokens = tokenizeCommandLine(cmdStr);
+      let tokens = [];
+      try { tokens = tokenizeCommandLine(cmdStr, { platform }); }
+      catch { warnings.push('Invalid MCP command quoting'); }
       if (tokens.length > 0) {
         executable = tokens[0];
         const rawArgs = tokens.slice(1);
@@ -1161,7 +1157,7 @@ export function createMcpDiscovery(options = {}) {
     let executable = null;
 
     if (command) {
-      const tokens = tokenizeCommandLine(command);
+      const tokens = tokenizeCommandLine(command, { platform: 'win32' });
       if (tokens.length > 0) {
         executable = tokens[0];
         const internalArgs = tokens.slice(1).map((arg, idx) => ({

@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { resolvePlatformPaths } from './core/platform-paths.mjs';
 import { attachRegistry } from './mcp-registry-store.mjs';
 import { safeFailureReason } from './core/switch-core.mjs';
 import { isMcpServiceId } from './core/mcp-registry-policy.mjs';
@@ -53,7 +54,7 @@ export function resolveKnownRealTunnelId(serviceId, maskedOrCorruptId, fallbackD
     path.resolve(process.cwd(), '..', 'generated-profiles'),
     path.resolve(process.cwd(), 'generated-profiles'),
     path.join('D:', 'MCP', 'generated-profiles'),
-    path.join(process.env.APPDATA || '', 'tunnel-client')
+    resolvePlatformPaths().tunnelConfigDir
   ].filter(d => Boolean(d) && fs.existsSync(d));
 
   const serviceAliases = {

@@ -1401,9 +1401,7 @@ export async function handleParallelStartSelected() {
 }
 
 /**
- * "一键关闭所有 tunnel-client": calls the guard-protected stop-all endpoint,
- * which marks every known instance stopped and force-terminates all
- * tunnel-client.exe on this host.
+ * Stop console-managed tunnels and display the verified backend result.
  */
 /* Progress helpers for the "close all tunnel-client" action. */
 function setProgressBar(panel, fill, label, pct, text) {
@@ -1436,7 +1434,7 @@ function hideParallelProgress(delayMs = 4000) {
 }
 
 export async function handleStopAllTunnelClients() {
-  if (!window.confirm('确定要强制关闭本机所有 tunnel-client 进程吗？这会中断所有正在运行的隧道。')) return;
+  if (!window.confirm('确定要关闭本控制台管理的隧道吗？这会中断这些实例的连接。')) return;
   if (dom.btnStopAllTunnelClients) dom.btnStopAllTunnelClients.disabled = true;
   setStopAllProgress(2, '已提交关闭任务…');
 
@@ -1460,6 +1458,8 @@ export async function handleStopAllTunnelClients() {
 
     if (!snapshot?.done) {
       showAlert('warning', '关闭任务超时', '已超出等待时间，请稍后刷新页面确认 tunnel-client 状态。');
+    } else if (snapshot.ok !== true) {
+      showAlert('warning', '关闭尚未全部确认', snapshot.message || '部分隧道的退出或状态更新尚未确认，请刷新后查看。');
     } else if (Number(snapshot.remaining) > 0) {
       const pids = Array.isArray(snapshot.remainingPids) ? snapshot.remainingPids.join(', ') : '';
       showAlert('warning', '仍有 tunnel-client 未关闭',
@@ -1467,11 +1467,11 @@ export async function handleStopAllTunnelClients() {
     } else {
       const clearedActive = Number(snapshot.clearedActions) || 0;
       const clearedOps = Number(snapshot.clearedOperations) || 0;
-      const gateText = `恢复闸门已复位${clearedActive + clearedOps > 0
+      const gateText = snapshot.recoveryReset === false ? '已更新核验结果' : `恢复闸门已复位${clearedActive + clearedOps > 0
         ? `（清理 ${clearedActive} 条待处理动作${clearedOps ? `、${clearedOps} 条异常操作` : ''}）`
         : ''}`;
-      showAlert('success', '已关闭所有 tunnel-client',
-        `已终止 ${snapshot.killed || 0} 个 tunnel-client 进程，将 ${snapshot.markedStopped || 0} 条账号隧道标记为停止；${gateText}，复查确认当前已无 tunnel-client 进程。`);
+      showAlert('success', '托管隧道已关闭',
+        `已停止 ${snapshot.killed || 0} 个进程，将 ${snapshot.markedStopped || 0} 条账号隧道标记为停止；${gateText}。退出范围：${snapshot.scope === 'managed' ? '本控制台管理的实例' : '本机 tunnel-client'}。`);
     }
     try { await loadDashboardData(); } catch (_) {}
   } catch (err) {

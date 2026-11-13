@@ -1,0 +1,95 @@
+name: macOS validation
+
+on:
+  push:
+    branches: [mac]
+  pull_request:
+    branches: [mac]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    name: macOS 15 / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      TEST_ARTIFACT_ROOT: ${{ github.workspace }}/artifacts/mac-port-20261113/unit-${{ matrix.arch }}
+      INSTALL_HOME: ${{ github.workspace }}/artifacts/mac-port-20261113/install-${{ matrix.arch }} 用户
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.14.0'
+          package-manager-cache: false
+      - name: Confirm native architecture and entry points
+        run: |
+          node -e 'if(process.platform!=="darwin"||process.arch!==process.argv[1])process.exit(1); console.log(process.platform,process.arch,process.version)' '${{ matrix.arch }}'
+          for script in Start-Console.command Install-Components.command scripts/install-components-macos.sh scripts/install-tunnel-client-macos.sh scripts/install-overleaf-macos.sh scripts/install-antigravity-macos.sh; do
+            /bin/bash -n "$script"
+          done
+          npm run check
+      - name: Complete default unit suite with unchanged per-file budgets
+        run: |
+          mkdir -p "$TEST_ARTIFACT_ROOT/tmp"
+          export TMPDIR="$TEST_ARTIFACT_ROOT/tmp"
+          export TMP="$TMPDIR" TEMP="$TMPDIR"
+          node scripts/run-tests.mjs --unit --report "$TEST_ARTIFACT_ROOT/report.json"
+      - name: Install real components into an isolated home
+        run: |
+          /bin/bash scripts/install-components-macos.sh --component all --yes --home-dir "$INSTALL_HOME"
+          /bin/bash scripts/install-components-macos.sh --component all --verify-only --home-dir "$INSTALL_HOME"
+      - name: MCP stdio handshakes without an account or IDE session
+        run: node scripts/smoke-components-macos.mjs --home-dir "$INSTALL_HOME"
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-macos-${{ matrix.arch }}
+          path: ${{ env.TEST_ARTIFACT_ROOT }}/report.json
+          if-no-files-found: warn
+
+  windows-protocol:
+    name: Windows native process protocol regression
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.14.0'
+          package-manager-cache: false
+      - name: Run all seven real Win32 handle tests under the existing 240 second file budget
+        shell: pwsh
+        run: |
+          $env:TEST_ARTIFACT_ROOT = Join-Path $env:GITHUB_WORKSPACE 'artifacts/mac-port-20261113/windows-native'
+          $env:TEMP = Join-Path $env:TEST_ARTIFACT_ROOT 'tmp'
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+          node scripts/run-tests.mjs tests/process-control.test.mjs --report "$env:TEST_ARTIFACT_ROOT/report.json"
+          exit $LASTEXITCODE
+      - name: Upload Windows process report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-windows-native
+          path: artifacts/mac-port-20261113/windows-native/report.json
+          if-no-files-found: warn

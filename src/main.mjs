@@ -1,9 +1,10 @@
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createVault } from './vault.mjs';
+import { createVault, ensurePrivateDirectory } from './vault.mjs';
+import { resolvePlatformPaths } from './core/platform-paths.mjs';
+import { processIdentityEvidence } from './core/process-identity-evidence.mjs';
 import { openStore } from './store.mjs';
 import { createAdapters, createRegisteredAdapterProvider, createInstanceAdapterProvider } from './adapters/index.mjs';
 import { createRunner } from './runner.mjs';
@@ -103,11 +104,9 @@ export async function startManager({
 
   const dataDir = customDataDir ||
     process.env.DATA_DIR ||
-    path.join(process.env.LOCALAPPDATA || os.homedir(), 'McpTunnelAccountManager');
+    resolvePlatformPaths().dataDir;
 
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
+  ensurePrivateDirectory(dataDir);
 
   const releases = [];
   let isClosed = false;
@@ -495,7 +494,7 @@ export async function startManager({
                     inspectionPromise = Promise.resolve().then(() => {
                       if (typeof adapter?.processController?.inspect !== 'function') return null;
                       return adapter.processController.inspect(srv.id, {
-                        executablePath: adapter.paths?.tunnelClientBin || (process.platform === 'win32' ? path.join(process.env.USERPROFILE || '', '.openai-tunnel', 'tunnel-client.exe') : null)
+                        executablePath: adapter.paths?.tunnelClientBin || resolvePlatformPaths().tunnelClientBin
                       });
                     });
                   }
@@ -565,12 +564,13 @@ export async function startManager({
                             startedAt: inspected.startedAt || inspected.startTime,
                             creationDate: inspected.startedAt || inspected.startTime,
                             creationTimeFileTime: inspected.creationTimeFileTime || null,
+                            ...processIdentityEvidence(inspected),
                             localPort: inspected.localPort || null,
                             healthURL: inspected.healthURL || null,
                             launchedAt: inspected.startedAt || inspected.startTime || nowIso,
                             updatedAt: nowIso
                           };
-                          fs.mkdirSync(path.dirname(adapter.processPath), { recursive: true });
+                          ensurePrivateDirectory(path.dirname(adapter.processPath));
                           fs.writeFileSync(adapter.processPath, JSON.stringify(recorded, null, 2), 'utf8');
                           if (typeof store?.registry?.handleSetActiveService === 'function') {
                             store.registry.handleSetActiveService(srv.id, matchedProfile.id, matchedProfile.revision || 1, srv.revision || 1);
@@ -762,7 +762,12 @@ export async function startManager({
               executable: null,
               cwd: null
             }),
-            reveal: async () => ({ ok: true, opened: true, message: '已请求打开所在目录' })
+            reveal: async () => {
+              const error = new Error('Directory reveal is unavailable');
+              error.code = 'REVEAL_UNAVAILABLE';
+              error.status = error.statusCode = 503;
+              throw error;
+            }
           };
         })());
 
@@ -783,6 +788,9 @@ export async function startManager({
               security,
               runner,
               adapters,
+              adapterProvider,
+              instanceAdapterProvider,
+              dataDir,
               publicDir,
               discovery,
               importer,
@@ -795,6 +803,9 @@ export async function startManager({
               security,
               runner,
               adapters,
+              adapterProvider,
+              instanceAdapterProvider,
+              dataDir,
               publicDir,
               discovery,
               importer,

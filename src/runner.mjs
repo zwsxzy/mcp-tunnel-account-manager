@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { resolvePlatformPaths } from './core/platform-paths.mjs';
 import { executeOperation } from './core/switch-core.mjs';
 import { acquireDaemonLock } from './core/daemon-lock.mjs';
 import { runMcpLifecycleAction, runMcpStopAction } from './core/mcp-lifecycle.mjs';
@@ -26,10 +27,7 @@ export function createRunner({
     throw new TypeError('A valid repo object is required to create a runner');
   }
 
-  const resolvedDataDir = dataDir
-    ?? (process.env.LOCALAPPDATA
-      ? path.join(process.env.LOCALAPPDATA, 'McpTunnelAccountManager')
-      : path.resolve('.data'));
+  const resolvedDataDir = dataDir ?? process.env.DATA_DIR ?? resolvePlatformPaths().dataDir;
 
   let resolvedAdapterProvider = adapterProvider;
   if (!resolvedAdapterProvider && adapters) {

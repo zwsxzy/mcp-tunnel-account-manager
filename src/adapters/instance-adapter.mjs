@@ -32,7 +32,8 @@ import { fileURLToPath } from 'node:url';
 import { ServiceAdapter, createDefaultProcessController } from './index.mjs';
 import { tunnelProbe as defaultTunnelProbe } from './tunnel-probe.mjs';
 import { SwitchFault } from '../core/switch-core.mjs';
-import { userProfilePath } from '../core/user-profile-path.mjs';
+import { resolvePlatformPaths } from '../core/platform-paths.mjs';
+import { ensurePrivateDirectory } from '../vault.mjs';
 import { isMcpServiceId } from '../core/mcp-registry-policy.mjs';
 import {
   InstanceFault,
@@ -101,7 +102,11 @@ export function realResolve(target) {
   const tail = [];
   for (let depth = 0; depth < 64; depth += 1) {
     try {
-      const real = fs.realpathSync.native(current).replace(/[\\/]+$/, '');
+      const resolvedAncestor = fs.realpathSync.native(current);
+      // The filesystem root is an ancestor too: removing its only separator
+      // would turn a missing absolute tail into a relative path.
+      const real = resolvedAncestor === path.parse(resolvedAncestor).root
+        ? resolvedAncestor : resolvedAncestor.replace(/[\\/]+$/, '');
       return tail.length ? path.join(real, ...tail.reverse()) : real;
     } catch {
       const parent = path.dirname(current);
@@ -121,9 +126,14 @@ export function realResolve(target) {
  * prefix test is what stops `...\McpTunnelAccountManager-dev` from being
  * mistaken for a child of `...\McpTunnelAccountManager`.
  */
-function isSameOrDescendant(candidate, root) {
-  const left = realResolve(candidate).toLowerCase().replace(/[\\/]+$/, '');
-  const right = realResolve(root).toLowerCase().replace(/[\\/]+$/, '');
+function isSameOrDescendant(candidate, root, { windows = false } = {}) {
+  const canonical = value => {
+    const native = windows ? String(value).replace(/[\\/]/g, path.sep) : value;
+    const resolved = realResolve(native).replace(windows ? /[\\/]+$/ : /\/+$/, '');
+    return windows ? resolved.toLowerCase() : resolved;
+  };
+  const left = canonical(candidate);
+  const right = canonical(root);
   if (!left || !right) return false;
   return left === right || left.startsWith(`${right}${path.sep}`);
 }
@@ -138,23 +148,35 @@ function isSameOrDescendant(candidate, root) {
  * `...\McpTunnelAccountManager\sub` and would have written instance profiles
  * inside the production data directory.
  */
-export function assertIsolatedInstanceDataDir(dataDir) {
+export function assertIsolatedInstanceDataDir(dataDir, { platform = process.platform, env = process.env, home } = {}) {
   if (typeof dataDir !== 'string' || dataDir.trim() === '' || dataDir.includes('\0')) {
     throw new InstanceFault('INVALID_INSTANCE', 'dataDir is required for instance adapters');
   }
   const resolved = path.resolve(dataDir);
 
-  if (process.env.LOCALAPPDATA) {
-    const productionDataDir = path.resolve(process.env.LOCALAPPDATA, 'McpTunnelAccountManager');
-    if (isSameOrDescendant(resolved, productionDataDir)) {
+  const defaults = resolvePlatformPaths({ platform, env, home });
+  if (env.LOCALAPPDATA || platform === 'win32') {
+    const productionDataDir = path.resolve(defaults.dataDir);
+    if (isSameOrDescendant(resolved, productionDataDir, { windows: true })) {
       throw new InstanceFault('INVALID_INSTANCE', 'production data directory is not allowed for concurrent instances');
     }
   }
 
-  if (process.env.APPDATA) {
-    const productionProfiles = path.resolve(process.env.APPDATA, 'tunnel-client');
-    if (isSameOrDescendant(resolved, productionProfiles)) {
-      throw new InstanceFault('INVALID_INSTANCE', 'production tunnel-client profile directory is not allowed for concurrent instances');
+  const productionProfiles = path.resolve(defaults.tunnelConfigDir);
+  if (isSameOrDescendant(resolved, productionProfiles, { windows: platform === 'win32' || Boolean(env.APPDATA) })) {
+    throw new InstanceFault('INVALID_INSTANCE', 'production tunnel-client profile directory is not allowed for concurrent instances');
+  }
+
+  // POSIX consoles own a dedicated instance scope below their default data root.
+  // Keep the Windows production-directory guard unchanged, including fixture overrides.
+  if (platform !== 'win32' && !env.LOCALAPPDATA && isSameOrDescendant(resolved, defaults.dataDir)) {
+    const scope = path.join(defaults.dataDir, 'runtime', 'instances');
+    if (realResolve(scope) === realResolve(defaults.dataDir) || !isSameOrDescendant(scope, defaults.dataDir)) {
+      throw new InstanceFault('INVALID_INSTANCE', 'instance scope must remain inside the manager data directory');
+    }
+    if (realResolve(resolved) === realResolve(defaults.dataDir)) return scope;
+    if (!isSameOrDescendant(resolved, scope)) {
+      throw new InstanceFault('INVALID_INSTANCE', 'concurrent instances must use the dedicated runtime/instances directory');
     }
   }
 
@@ -232,10 +254,11 @@ export function rewriteInstanceLaunchArgs(args, {
   profileDir,
   profileName,
   healthUrlFile,
-  listenAddr = INSTANCE_LISTEN_ADDR
+  listenAddr = INSTANCE_LISTEN_ADDR,
+  platform = process.platform
 }) {
   const source = Array.isArray(args) ? args : [];
-  const valueFlags = new Set(['--profile', '--profile-dir', '--health.listen-addr', '--health.url-file']);
+  const valueFlags = new Set(['--profile', '--profile-dir', '--profile-file', '--health.listen-addr', '--health.url-file']);
   const kept = [];
 
   for (let i = 0; i < source.length; i++) {
@@ -254,8 +277,9 @@ export function rewriteInstanceLaunchArgs(args, {
   }
 
   const instanceArgs = [
-    '--profile-dir', profileDir,
-    '--profile', profileName,
+    ...(platform === 'darwin'
+      ? ['--profile-file', path.join(profileDir, `${profileName}.yaml`)]
+      : ['--profile-dir', profileDir, '--profile', profileName]),
     '--health.listen-addr', listenAddr,
     '--health.url-file', healthUrlFile
   ];
@@ -319,15 +343,17 @@ export function createInstanceProcessController(processController, { instanceId,
   return scoped;
 }
 
-function resolveInstancePaths({ paths = {} } = {}) {
-  const userProfile = paths.userProfile || process.env.USERPROFILE || userProfilePath();
-  const appData = paths.appData || process.env.APPDATA || path.join(userProfile, 'AppData', 'Roaming');
-  const tunnelHome = paths.tunnelHome || path.join(userProfile, '.openai-tunnel');
+function resolveInstancePaths({ paths = {}, platform = process.platform, env = process.env, home } = {}) {
+  const defaults = resolvePlatformPaths({ platform, home, env: {
+    ...env,
+    ...(paths.userProfile ? { USERPROFILE: paths.userProfile } : {}),
+    ...(paths.appData ? { APPDATA: paths.appData } : {})
+  } });
+  const tunnelHome = paths.tunnelHome || defaults.tunnelHome;
   return {
-    userProfile,
-    appData,
+    ...defaults,
     tunnelHome,
-    tunnelClientBin: path.join(tunnelHome, 'tunnel-client.exe'),
+    tunnelClientBin: path.join(tunnelHome, platform === 'win32' ? 'tunnel-client.exe' : 'tunnel-client'),
     ...paths
   };
 }
@@ -349,7 +375,10 @@ export class InstanceAdapter {
     vault = null,
     processController = null,
     healthURL = null,
-    healthTimeoutMs = null
+    healthTimeoutMs = null,
+    platform = process.platform,
+    env = process.env,
+    home
   } = {}) {
     const target = assertInstanceTarget({ serviceId, profileId });
 
@@ -360,7 +389,8 @@ export class InstanceAdapter {
     this.profileSegment = target.profileSegment;
     this.definition = definition || null;
     this.vault = vault || null;
-    this.dataDir = assertIsolatedInstanceDataDir(dataDir);
+    this.platform = platform;
+    this.dataDir = assertIsolatedInstanceDataDir(dataDir, { platform, env, home });
     this.probe = probe || null;
 
     this.profileYaml = profileYamlFileName(this.service, this.profileId);
@@ -400,7 +430,7 @@ export class InstanceAdapter {
       ? Math.max(0, healthTimeoutMs)
       : (usesRealAuditedHelper ? HEALTH_URL_TIMEOUT_REAL_MS : HEALTH_URL_TIMEOUT_FAKE_MS);
 
-    const basePaths = resolveInstancePaths({ paths });
+    const basePaths = resolveInstancePaths({ paths, platform, env, home });
     const delegatePaths = {
       ...basePaths,
       listenAddr: INSTANCE_LISTEN_ADDR,
@@ -458,8 +488,8 @@ export class InstanceAdapter {
   }
 
   _writeProcessRecord(record) {
-    fs.mkdirSync(path.dirname(this.processPath), { recursive: true });
-    fs.writeFileSync(this.processPath, JSON.stringify(record, null, 2), 'utf8');
+    ensurePrivateDirectory(path.dirname(this.processPath));
+    fs.writeFileSync(this.processPath, JSON.stringify(record, null, 2), { encoding: 'utf8', mode: 0o600 });
     return record;
   }
 
@@ -576,7 +606,8 @@ export class InstanceAdapter {
       profileDir: this.profileDir,
       profileName: this.profileName,
       healthUrlFile: this.healthUrlFile,
-      listenAddr: INSTANCE_LISTEN_ADDR
+      listenAddr: INSTANCE_LISTEN_ADDR,
+      platform: this.platform
     });
 
     // `...base` first: HTTP-transport fields (isHttp, httpPlan, serviceMcpEnv) and
@@ -630,11 +661,9 @@ export class InstanceAdapter {
   _sourceServiceConfigPath() {
     const stemByService = { 'overleaf-mcp': 'overleaf', 'antigravity-mcp': 'antigravity-local' };
     const stem = stemByService[this.service] || this.service;
-    const appData = this.paths?.appData
-      || process.env.APPDATA
-      || path.join(this.paths?.userProfile || process.env.USERPROFILE || '', 'AppData', 'Roaming');
+    const configDir = this.paths?.tunnelConfigDir || resolvePlatformPaths().tunnelConfigDir;
     const candidates = [
-      path.join(appData, 'tunnel-client', `${stem}.yaml`),
+      path.join(configDir, `${stem}.yaml`),
       this.definition?.locations?.effectiveConfigPath || null
     ].filter(Boolean);
     for (const candidate of candidates) {
@@ -654,8 +683,8 @@ export class InstanceAdapter {
       if (!source) return;
       const raw = fs.readFileSync(source, 'utf8');
       if (!raw.trim()) return;
-      fs.mkdirSync(path.dirname(this.configPath), { recursive: true });
-      fs.writeFileSync(this.configPath, raw, 'utf8');
+      ensurePrivateDirectory(path.dirname(this.configPath));
+      fs.writeFileSync(this.configPath, raw, { encoding: 'utf8', mode: 0o600 });
     } catch (_) {
       // Seeding is best-effort: a failure here falls back to the generated default.
     }
@@ -898,12 +927,15 @@ export function createInstanceAdapter(options = {}) {
     healthURL = null,
     healthTimeoutMs = null,
     runtimeCommand,
-    scriptPath = null
+    scriptPath = null,
+    platform = process.platform,
+    env = process.env,
+    home
   } = options || {};
 
   const target = assertInstanceTarget({ serviceId, profileId });
-  const resolvedDataDir = assertIsolatedInstanceDataDir(dataDir);
-  const resolvedPaths = resolveInstancePaths({ paths });
+  const resolvedDataDir = assertIsolatedInstanceDataDir(dataDir, { platform, env, home });
+  const resolvedPaths = resolveInstancePaths({ paths, platform, env, home });
 
   const baseController = processController || createDefaultProcessController({
     dataDir: resolvedDataDir,
@@ -922,7 +954,10 @@ export function createInstanceAdapter(options = {}) {
     vault,
     processController: baseController,
     healthURL,
-    healthTimeoutMs
+    healthTimeoutMs,
+    platform,
+    env,
+    home
   });
 }
 
@@ -962,11 +997,14 @@ export function createInstanceAdapterProvider(options = {}) {
     healthURL = null,
     runtimeCommand,
     scriptPath = null,
-    resolveDefinition: resolveDefinitionFn = null
+    resolveDefinition: resolveDefinitionFn = null,
+    platform = process.platform,
+    env = process.env,
+    home
   } = options || {};
 
-  const resolvedDataDir = assertIsolatedInstanceDataDir(dataDir);
-  const resolvedPaths = resolveInstancePaths({ paths });
+  const resolvedDataDir = assertIsolatedInstanceDataDir(dataDir, { platform, env, home });
+  const resolvedPaths = resolveInstancePaths({ paths, platform, env, home });
   const resolvedProbe = probe !== undefined ? probe : defaultTunnelProbe;
 
   const baseController = processController || createDefaultProcessController({
@@ -1006,7 +1044,10 @@ export function createInstanceAdapterProvider(options = {}) {
       probe: resolvedProbe,
       vault,
       processController: baseController,
-      healthURL: (healthURLs && healthURLs[target.instanceId]) || healthURL || null
+      healthURL: (healthURLs && healthURLs[target.instanceId]) || healthURL || null,
+      platform,
+      env,
+      home
     });
 
     // Bounded cache for non-runner entry points: an unbounded map of instance

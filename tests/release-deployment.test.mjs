@@ -41,6 +41,7 @@ after(() => {
 });
 
 const { startManager } = await import('../src/main.mjs');
+const { createAdapters } = await import('../src/adapters/index.mjs');
 
 function listFiles(root) {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap(entry => {
@@ -78,11 +79,38 @@ test('distribution contains the web UI, runtime entry and deployment scripts', (
   assert.equal(Object.keys(metadata.dependencies || {}).length, 0);
 });
 
-test('tunnel launch waits for the asynchronous health listener before registration', () => {
-  const source = fs.readFileSync(path.join(projectRoot, 'src/adapters/index.mjs'), 'utf8');
-  assert.match(source, /const inspectDeadline = Date\.now\(\) \+ 10000/);
-  assert.match(source, /if \(verifiedHealthURL\) break/);
-  assert.match(source, /running tunnel without a health URL is not ready/i);
+test('tunnel verification waits for its asynchronous owned health listener before registration', async () => {
+  const dataDir = path.join(temporary, 'late-health-data');
+  const identity = { pid: 424242, executablePath: path.join(temporary, 'synthetic-client'),
+    startTime: '2026-11-13T00:00:00.000Z', running: true };
+  let launched = false;
+  let inspections = 0;
+  const probes = [];
+  const controller = {
+    async inspect() {
+      if (!launched) return { running: false, absenceVerified: true };
+      inspections += 1;
+      return inspections === 1 ? identity : { ...identity, localPort: 31415, healthURL: 'http://127.0.0.1:31415' };
+    },
+    async launch() { launched = true; return identity; }
+  };
+  const probe = { isDefault: true, checkReady: async () => true, async verify(input) {
+    probes.push(input);
+    assert.equal(input.healthURL, 'http://127.0.0.1:31415');
+    assert.equal(input.identity.pid, identity.pid);
+    return { ok: true, verified: true, identity: input.identity };
+  } };
+  const adapter = createAdapters({ dataDir, processController: controller, probe,
+    paths: { userProfile: replacements.USERPROFILE, appData: path.join(temporary, 'late-health-config'),
+      tunnelHome: temporary, tunnelClientBin: identity.executablePath },
+    definitions: [{ id: 'mcp_late_health' }] }).mcp_late_health;
+  const operationId = 'synthetic-late-health';
+  const snapshot = await adapter.prepare({ operationId, credential: { tunnelId: 'synthetic-tunnel', apiKey: 'synthetic-key' } });
+  await adapter.applyIfUnchanged({ operationId, snapshot });
+  const receipt = await adapter.verifyDesired({ operationId, snapshot });
+  assert.equal(receipt.verified, true);
+  assert.equal(inspections, 2, 'the first observation without a listener cannot register a tunnel');
+  assert.equal(probes.length, 1, 'authenticated verification runs only after the owned endpoint is observed');
 });
 
 test('rollback re-registers an audited live original process instead of losing ownership', () => {

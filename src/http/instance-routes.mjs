@@ -16,6 +16,7 @@
  */
 
 import fs from 'node:fs';
+import { processIdentityEvidence } from '../core/process-identity-evidence.mjs';
 import {
   sanitizeProfileSegment,
   buildInstanceId,
@@ -682,7 +683,7 @@ export function createInstanceRoutes({
       const executablePath = typeof (src.executablePath || src.executable) === 'string'
         ? (src.executablePath || src.executable) : null;
       if (!pid || !startedAt || !executablePath) return null;
-      return { pid, startedAt, executablePath };
+      return { pid, startedAt, executablePath, ...processIdentityEvidence(src) };
     };
 
     /** Reads the adapter's own launch record (written when this instance started). */
@@ -789,7 +790,8 @@ export function createInstanceRoutes({
       }
       if (!verified) return { unverified: true };
       return {
-        identity: { ...persisted, verified: true },
+        identity: { pid: persisted.pid, startedAt: persisted.startedAt,
+          executablePath: persisted.executablePath, verified: true },
         absenceVerified: false
       };
     }

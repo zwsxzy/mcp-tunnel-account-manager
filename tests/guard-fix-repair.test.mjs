@@ -815,6 +815,36 @@ test('carrier: the verifier is consulted with the RECORDED identity, not the ins
   assert.equal(received.startedAt, '2026-11-12T00:00:00.000Z');
 });
 
+test('carrier: POSIX launch evidence reaches the verifier and private control fields stay out of the response', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'carrier-posix-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const processPath = path.join(directory, 'owned-process.json');
+  const posix = { version: 1, scope: buildInstanceId(SERVICE, PROFILE),
+    launchId: 'fc5c2c44-fc77-4583-8121-a522181c0349', supervisorPid: 4321, processGroupId: 4321 };
+  const recorded = { ...LIVE_RECORD, executablePath: '/Users/Test User/.openai-tunnel/tunnel-client',
+    processStartToken: 'darwin-ps-seconds:synthetic-boot:1794518400', posix,
+    token: 'PRIVATE_CONTROL_FIXTURE', env: { PRIVATE: 'DO_NOT_PUBLISH_FIXTURE' } };
+  fs.writeFileSync(processPath, JSON.stringify(recorded));
+  let verified = null;
+  const res = await stopViaCarrier(t, {
+    record: recorded,
+    provider: () => ({ processPath, processController: {
+      async inspectInstance() { return { running: true, pid: process.pid }; },
+      async verify(expected) {
+        verified = expected;
+        return { valid: expected.processStartToken === recorded.processStartToken &&
+          expected.posix?.launchId === posix.launchId && expected.posix?.scope === posix.scope };
+      }
+    } })
+  });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body?.code, 'CARRIER_CONFIRMATION_REQUIRED');
+  assert.deepEqual(verified.posix, posix);
+  assert.equal(verified.token, undefined);
+  assert.equal(verified.env, undefined);
+  assert.doesNotMatch(JSON.stringify(res.body), /PRIVATE_CONTROL_FIXTURE|DO_NOT_PUBLISH_FIXTURE|processStartToken|launchId/);
+});
+
 test('carrier: a live pid with NO expected identity at all is unverified', async (t) => {
   // No persisted row and no adapter launch record: the live process is unowned,
   // so there is nothing that could tie it to this instance.

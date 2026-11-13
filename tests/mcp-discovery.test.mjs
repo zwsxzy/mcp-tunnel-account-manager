@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import {
   createMcpDiscovery,
   maskTunnelId,
@@ -15,6 +16,50 @@ import {
   parseRestrictedJson
 } from '../src/config/mcp-discovery.mjs';
 import { discoveryIdentity } from '../src/core/mcp-registry-policy.mjs';
+import { formatWindowsCommandLine, bindingToTunnelCommand, parsePosixCommandLine } from '../src/adapters/mcp-binding.mjs';
+import { tunnelProfile, quoteCommandArgument } from '../scripts/install-components-macos.mjs';
+
+test('Mac installer YAML discovers the exact argv for Unicode, spaces, apostrophes and backslashes', async t => {
+  const artifacts = fileURLToPath(new URL('../artifacts/mac-port-20261113/binding-tests/', import.meta.url));
+  fs.mkdirSync(artifacts, { recursive: true });
+  const root = fs.mkdtempSync(path.join(artifacts, 'discovery-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const argv = [
+    path.join(root, "用户 O'Reilly", 'venv', 'bin', 'python'),
+    path.join(root, "Project 'notes'", 'server.py'),
+    'back\\slash', '$(literal)', '$&', 'quote"inside # literal', '--stdio'
+  ];
+  const command = argv.map(quoteCommandArgument).join(' ');
+  const installedYaml = tunnelProfile(command);
+  const scalar = parseRestrictedYaml(installedYaml).data.mcp.commands[0].command;
+  assert.equal(scalar, command);
+  assert.deepEqual(tokenizeCommandLine(scalar, { platform: 'darwin' }), argv);
+
+  // The manager's later writes use JSON double-quoted scalars, which must retain
+  // the same command as the installer's YAML single-quoted scalars.
+  const rewrittenYaml = installedYaml.replace(/^(\s*command:) .*$/m,
+    (_line, prefix) => `${prefix} ${JSON.stringify(command)}`);
+  assert.equal(parseRestrictedYaml(rewrittenYaml).data.mcp.commands[0].command, command);
+  for (const [index, yaml] of [installedYaml, rewrittenYaml].entries()) {
+    const config = path.join(root, `antigravity-${index}.yaml`);
+    fs.writeFileSync(config, yaml);
+    const discovery = createMcpDiscovery({ platform: 'darwin', env: {}, home: root,
+      sources: [{ path: config, kind: 'yaml', serviceId: 'antigravity-mcp' }] });
+    const found = await discovery.scan();
+    assert.equal(found.length, 1);
+    const { definition } = await discovery.loadCandidate(found[0].id);
+    assert.deepEqual([definition.binding.executable, ...definition.binding.args.map(arg => arg.value)], argv);
+    const launched = bindingToTunnelCommand(definition.binding, { platform: 'darwin' });
+    assert.deepEqual(parsePosixCommandLine(launched.command), argv);
+  }
+});
+
+test('platform-specific discovery tokenizer retains Windows path and empty-argument semantics', () => {
+  const argv = ['C:\\Program Files\\node.exe', 'C:\\Projects\\server.js', "O'Reilly", 'trailing\\', '', 'quote"here'];
+  const command = formatWindowsCommandLine(argv[0], argv.slice(1));
+  assert.deepEqual(tokenizeCommandLine(command, { platform: 'win32' }), argv);
+  assert.equal(parseRestrictedYaml("value: 'O''Reilly # literal' # comment\n").data.value, "O'Reilly # literal");
+});
 
 test('maskTunnelId masks properly without leaking full ID', () => {
   assert.equal(maskTunnelId(null), null);

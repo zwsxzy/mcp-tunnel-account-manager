@@ -109,6 +109,61 @@ export function formatWindowsCommandLine(executable, args = []) {
   return parts.join(' ');
 }
 
+/** Literal POSIX argument quoting; no variable or command expansion is needed. */
+export function quotePosixArg(arg) {
+  if (typeof arg !== 'string') arg = String(arg ?? '');
+  if (arg.includes('\0')) reject('INVALID_ARG_VALUE');
+  return `'${arg.replaceAll("'", "'\"'\"'")}'`;
+}
+
+export function formatPosixCommandLine(executable, args = []) {
+  if (typeof executable !== 'string' || executable.length === 0 || executable.includes('\0')) {
+    reject('INVALID_EXECUTABLE');
+  }
+  const values = Array.isArray(args)
+    ? args.map(arg => (arg !== null && typeof arg === 'object') ? arg.value : arg) : [];
+  return [executable, ...values].map(quotePosixArg).join(' ');
+}
+
+/**
+ * Parse tunnel-client's POSIX-style quoting without invoking a shell.
+ * Preserve explicit empty arguments so callers can reject unsupported launches
+ * instead of silently losing information, as tunnel-client <= 0.0.20 does.
+ */
+export function parsePosixCommandLine(command) {
+  if (typeof command !== 'string' || !command) return [];
+  if (command.includes('\0')) reject('INVALID_COMMAND_LINE');
+  const args = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  let started = false;
+  for (const char of command) {
+    if (escaped) { current += char; escaped = false; started = true; continue; }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '\\') { escaped = true; started = true; continue; }
+    if (quote === '"') {
+      if (char === '"') quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; started = true; continue; }
+    if (/[ \t\n\r]/.test(char)) {
+      if (started) { args.push(current); current = ''; started = false; }
+      continue;
+    }
+    current += char;
+    started = true;
+  }
+  if (escaped || quote) reject('INVALID_COMMAND_LINE');
+  if (started) args.push(current);
+  return args;
+}
+
 /**
  * Parses a Windows command line string into an array of string tokens
  * following CommandLineToArgvW rules.
@@ -678,8 +733,15 @@ export function bindingToTunnelCommand(binding, options = {}) {
   const resolved = resolveExecutable(binding.executable, options);
   const argValues = (binding.args || []).map(a => (a !== null && typeof a === 'object') ? a.value : String(a));
   const allArgs = [...resolved.prependArgs, ...argValues];
+  const platform = options.platform ?? process.platform;
+  // v0.0.19 and v0.0.20 append parsed tokens only when their builder is nonempty:
+  // https://github.com/openai/tunnel-client/blob/v0.0.20/pkg/runtimeconfig/config.go
+  // Keep the Windows contract intact; POSIX must fail instead of dropping argv.
+  if (platform !== 'win32' && allArgs.some(arg => arg === '')) {
+    reject('EMPTY_ARGUMENT_UNSUPPORTED');
+  }
   return {
-    command: formatWindowsCommandLine(resolved.executable, allArgs),
+    command: (platform === 'win32' ? formatWindowsCommandLine : formatPosixCommandLine)(resolved.executable, allArgs),
     executable: resolved.executable,
     args: allArgs,
     cwd: binding.cwd || null

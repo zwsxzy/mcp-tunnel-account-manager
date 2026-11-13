@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   quoteWindowsArg,
   parseWindowsCommandLine,
   formatWindowsCommandLine,
+  quotePosixArg,
+  formatPosixCommandLine,
+  parsePosixCommandLine,
   resolveExecutable,
   mergeBindingArgs,
   publicBindingArgs,
@@ -22,6 +26,52 @@ import {
   isReservedServiceEnvName,
   hasPrivateQuery
 } from '../src/adapters/mcp-binding.mjs';
+
+test('POSIX command formatting round-trips literal arguments through real Python shlex', {
+  skip: process.platform === 'win32'
+}, () => {
+  const argv = [
+    "/Users/O'Reilly 中文/.venv/bin/python", 'server script.py', "O'Reilly", '',
+    'trailing\\', 'C:\\literal\\backslashes', 'quote"inside', "both'\"quotes",
+    '$(never-run)', '`never-run-either`', '$HOME', '$&', 'line\nbreak', 'tab\there',
+    'emoji 😀', 'single" quote # literal', 'a;b|c&d>e<f'
+  ];
+  const command = formatPosixCommandLine(argv[0], argv.slice(1));
+  // Feed data over stdin; the command under test is never executed or passed to a shell.
+  const output = execFileSync('python3', ['-c',
+    'import json, shlex, sys; print(json.dumps(shlex.split(json.load(sys.stdin)), ensure_ascii=False))'
+  ], { input: JSON.stringify(command), encoding: 'utf8', shell: false });
+  assert.deepEqual(JSON.parse(output), argv);
+  assert.deepEqual(parsePosixCommandLine(command), argv);
+});
+
+test('POSIX formatter encodes empty and apostrophe arguments, rejects NUL, and preserves native defaults', () => {
+  assert.equal(quotePosixArg(''), "''");
+  assert.equal(quotePosixArg("O'Reilly"), "'O'\"'\"'Reilly'");
+  assert.throws(() => quotePosixArg('nul\0argument'), { code: 'INVALID_ARG_VALUE' });
+  assert.throws(() => formatPosixCommandLine(''), { code: 'INVALID_EXECUTABLE' });
+  const binding = { type: 'stdio', executable: "/Users/O'Reilly/工具/bin/python", args: [
+    { id: 'script', value: 'folder with spaces/server.py' },
+    { id: 'literal', value: "back\\slash ' apostrophe $(literal)" }
+  ] };
+  for (const platform of ['darwin', 'linux']) {
+    const result = bindingToTunnelCommand(binding, { platform });
+    assert.deepEqual(parsePosixCommandLine(result.command), [binding.executable, ...binding.args.map(arg => arg.value)]);
+    assert.equal(result.command, formatPosixCommandLine(binding.executable, binding.args));
+  }
+  const formatter = process.platform === 'win32' ? formatWindowsCommandLine : formatPosixCommandLine;
+  assert.equal(bindingToTunnelCommand(binding).command, formatter(binding.executable, binding.args));
+});
+
+test('POSIX bindings reject empty argv unsupported by tunnel-client v0.0.19 and v0.0.20', () => {
+  const binding = { type: 'stdio', executable: 'python', args: [{ id: 'empty', value: '' }] };
+  for (const platform of ['darwin', 'linux']) {
+    assert.throws(() => bindingToTunnelCommand(binding, { platform }), { code: 'EMPTY_ARGUMENT_UNSUPPORTED' });
+  }
+  assert.deepEqual(parseWindowsCommandLine(bindingToTunnelCommand(binding, { platform: 'win32' }).command), ['python', '']);
+  assert.throws(() => parsePosixCommandLine("python 'unfinished"), { code: 'INVALID_COMMAND_LINE' });
+  assert.throws(() => parsePosixCommandLine('python trailing\\'), { code: 'INVALID_COMMAND_LINE' });
+});
 
 test('1. quoteWindowsArg escapes arguments according to CommandLineToArgvW rules', () => {
   // Empty string
@@ -332,7 +382,7 @@ test('9. bindingToTunnelCommand formats upstream tunnel-client 0.0.19 command', 
     cwd: 'C:\\mcp'
   };
 
-  const cmd = bindingToTunnelCommand(binding);
+  const cmd = bindingToTunnelCommand(binding, { platform: 'win32' });
   assert.equal(cmd.executable, 'python');
   assert.equal(cmd.cwd, 'C:\\mcp');
   assert.deepEqual(cmd.args, ['server.py', 'value with spaces']);

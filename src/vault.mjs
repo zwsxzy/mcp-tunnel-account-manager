@@ -3,6 +3,58 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import child_process from 'node:child_process';
 
+function unsafePrivatePath(targetPath, reason) {
+  const error = new Error(`UNSAFE_PRIVATE_PATH: ${reason}: ${targetPath}`);
+  error.code = 'UNSAFE_PRIVATE_PATH';
+  return error;
+}
+
+function assertOwnedPath(stat, targetPath, directory = false) {
+  if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())) {
+    throw unsafePrivatePath(targetPath, directory ? 'expected a real directory' : 'expected a regular file, not a symbolic link');
+  }
+  if (process.platform !== 'win32' && typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw unsafePrivatePath(targetPath, 'owner does not match the current user');
+  }
+}
+
+/** Existing directories also need their mode tightened; mkdir's mode is creation-only. */
+export function ensurePrivateDirectory(targetPath) {
+  fs.mkdirSync(targetPath, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') {
+    assertOwnedPath(fs.lstatSync(targetPath), targetPath, true);
+    fs.chmodSync(targetPath, 0o700);
+  }
+}
+
+function openOwnedPrivateFile(targetPath) {
+  assertOwnedPath(fs.lstatSync(targetPath), targetPath);
+  const flags = fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 :
+    (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  const descriptor = fs.openSync(targetPath, flags);
+  try {
+    assertOwnedPath(fs.fstatSync(descriptor), targetPath);
+    if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
+    return descriptor;
+  } catch (error) {
+    fs.closeSync(descriptor);
+    throw error;
+  }
+}
+
+/** Secure already-written authentication files without following a final symlink. */
+export function securePrivateFile(targetPath, { allowMissing = false } = {}) {
+  let descriptor;
+  try {
+    descriptor = openOwnedPrivateFile(targetPath);
+  } catch (error) {
+    if (allowMissing && error.code === 'ENOENT') return;
+    throw error;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
 /**
  * Enforces Windows NTFS ACL restrictions on target file or directory.
  * Disables inheritance and grants FullControl exclusively to the current user and SYSTEM (*S-1-5-18).
@@ -44,7 +96,7 @@ export function createVault({ dataDir } = {}) {
   }
 
   const resolvedDir = path.resolve(dataDir);
-  fs.mkdirSync(resolvedDir, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(resolvedDir);
 
   const keyPath = path.join(resolvedDir, 'master.key');
   let masterKey;
@@ -58,13 +110,21 @@ export function createVault({ dataDir } = {}) {
     enforceWindowsAcls(keyPath);
   } catch (err) {
     if (err && err.code === 'EEXIST') {
-      const existingKey = fs.readFileSync(keyPath);
-      if (existingKey.length !== 32) {
-        throw new Error(
-          `Invalid master key in ${keyPath}: expected 32 bytes, got ${existingKey.length}`
-        );
+      const descriptor = openOwnedPrivateFile(keyPath);
+      try {
+        const size = fs.fstatSync(descriptor).size;
+        if (size !== 32) {
+          throw new Error(`Invalid master key in ${keyPath}: expected 32 bytes, got ${size}`);
+        }
+        const existingKey = fs.readFileSync(descriptor);
+        if (existingKey.length !== 32) {
+          throw new Error(`Invalid master key in ${keyPath}: expected 32 bytes, got ${existingKey.length}`);
+        }
+        masterKey = Buffer.from(existingKey);
+        existingKey.fill(0);
+      } finally {
+        fs.closeSync(descriptor);
       }
-      masterKey = Buffer.from(existingKey);
       enforceWindowsAcls(keyPath);
     } else {
       throw err;

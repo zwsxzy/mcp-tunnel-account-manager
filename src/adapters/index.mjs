@@ -1,5 +1,6 @@
 import { persistHttpState, loadHttpState, getHttpStatePath } from './http-state-store.mjs';
 import { userProfilePath } from '../core/user-profile-path.mjs';
+import { resolvePlatformPaths } from '../core/platform-paths.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -8,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { SwitchFault } from '../core/switch-core.mjs';
 import { assertStoppedConnectionReceipt, isMcpServiceId } from '../core/mcp-registry-policy.mjs';
 import { createTunnelProbe, tunnelProbe as defaultTunnelProbe } from './tunnel-probe.mjs';
-import { bindingToTunnelCommand, formatWindowsCommandLine } from './mcp-binding.mjs';
+import { bindingToTunnelCommand, formatWindowsCommandLine, formatPosixCommandLine } from './mcp-binding.mjs';
 import {
   sealHttpTransport,
   openHttpTransport,
@@ -20,6 +21,7 @@ import {
 } from './http-transport.mjs';
 import { buildTunnelLaunchEnvironment, TunnelLaunchEnvironmentFault } from './tunnel-launch-environment.mjs';
 import { createPsWorkerPool, createHelperBudget, PsWorkerFault, PS_FAULT_CODES } from './ps-worker-pool.mjs';
+import { createPosixProcessController } from './posix-process-controller.mjs';
 import { DEFAULT_CRITICAL_SERVICE_IDS } from '../core/resource-policy.mjs';
 import {
   getHttpTransportPacketPath,
@@ -30,8 +32,9 @@ import {
 
 export { SwitchFault, HttpTransportFault, TunnelLaunchEnvironmentFault, buildTunnelLaunchEnvironment, createTunnelProbe, defaultTunnelProbe, ServiceAdapter };
 
-export function resolveDefaultProxy() {
-  return process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || 'http://127.0.0.1:7897';
+export function resolveDefaultProxy(env = process.env, platform = process.platform) {
+  return env.HTTPS_PROXY || env.HTTP_PROXY || env.ALL_PROXY ||
+    (platform === 'darwin' ? '' : 'http://127.0.0.1:7897');
 }
 
 export const DEFAULT_PROXY = resolveDefaultProxy();
@@ -50,7 +53,9 @@ export const SAFE_INHERITED_KEYS = [
   'PROGRAMFILES(X86)', 'ProgramFiles(x86)',
   'PROGRAMDATA', 'ProgramData',
   'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE',
-  'OS', 'NODE_ENV'
+  'OS', 'NODE_ENV',
+  'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME'
 ];
 
 /**
@@ -82,6 +87,20 @@ export function buildSafePinnedEnv(explicit = {}, { codexBridgeEnabled } = {}) {
     ...pinned,
     ...explicit
   };
+}
+
+function platformProfileEnvironment(paths = {}) {
+  const inherited = {};
+  const posix = (paths.platform || process.platform) !== 'win32';
+  if (paths.userProfile) {
+    inherited.USERPROFILE = paths.userProfile;
+    if (posix) inherited.HOME = paths.userProfile;
+  }
+  if (paths.appData) {
+    inherited.APPDATA = paths.appData;
+    if (posix) inherited.XDG_CONFIG_HOME = paths.appData;
+  }
+  return inherited;
 }
 
 function sha256(data) {
@@ -138,7 +157,8 @@ function updateYamlControlPlane(rawYaml, { tunnelId, organizationId, apiKey = 'e
       // tunnel-client rejected the config ("did not find expected hexdecimal
       // number"). JSON.stringify yields a valid YAML double-quoted scalar with
       // every backslash escaped, matching the binding branches below.
-      lines.push(`      command: ${JSON.stringify(`node ${userProfilePath('.overleaf-mcp', 'runtime', 'node_modules', 'mcp-server-overleaf', 'dist', 'index.js')} --stdio`)}`);
+      const formatCommand = process.platform === 'win32' ? formatWindowsCommandLine : formatPosixCommandLine;
+      lines.push(`      command: ${JSON.stringify(formatCommand('node', [userProfilePath('.overleaf-mcp', 'runtime', 'node_modules', 'mcp-server-overleaf', 'dist', 'index.js'), '--stdio']))}`);
     } else if (service === 'antigravity-mcp') {
       lines.push('    - channel: main');
       lines.push('      command: "antigravity-mcp"');
@@ -422,6 +442,9 @@ export function createDefaultProcessController({
   scriptPath,
   runtimeCommand,
   paths,
+  platform = process.platform,
+  processReader = null,
+  posixOptions = {},
   criticalServiceIds = DEFAULT_CRITICAL_SERVICE_IDS,
   psWorkerPool = null,
   psWorkerLimits = {},
@@ -437,6 +460,19 @@ export function createDefaultProcessController({
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout
 } = {}) {
+  // Explicit runtimeCommand/psWorkerPool are the existing fake/native Windows
+  // test seams. Production macOS/Linux dispatches before any PowerShell work;
+  // a bundled .ps1 path is never a reason to invoke it on POSIX.
+  if (platform !== 'win32' && typeof runtimeCommand !== 'function' && !psWorkerPool) {
+    return createPosixProcessController({
+      ...posixOptions,
+      dataDir, paths, platform, processReader,
+      criticalServiceIds, helperBudget, helperBudgetOptions, spawnHelper,
+      helperExecutionTimeoutMs, helperKillGraceMs, setTimeoutFn, clearTimeoutFn,
+      buildDefaultEnvironment: () => buildTunnelLaunchEnvironment({ inheritedEnvironment: buildSafePinnedEnv({}) }),
+      supervisorEnvironment: buildSafePinnedEnv({})
+    });
+  }
   const runtimeDir = path.join(dataDir, 'runtime');
   const criticalIds = new Set((Array.isArray(criticalServiceIds) ? criticalServiceIds : []).map(String));
 
@@ -1072,7 +1108,7 @@ export function createDefaultProcessController({
         return identity;
       }
 
-      if (process.platform === 'win32') {
+      if (platform === 'win32' || psWorkerPool) {
         const payload = {
           executablePath: command,
           arguments: args || [],
@@ -1116,91 +1152,7 @@ export function createDefaultProcessController({
         return identity;
       }
 
-      const spawnStartedIso = new Date().toISOString();
-      let spawnError = null;
-      const child = spawn(command, args || [], {
-        cwd: cwd || undefined,
-        env: safeEnv,
-        detached: true,
-        windowsHide: true,
-        stdio: 'ignore'
-      });
-      child.on('error', (err) => {
-        spawnError = err;
-      });
-      child.unref();
-
-      // Bounded wait to catch immediate spawn failure
-      await new Promise(r => setTimeout(r, 60));
-      if (spawnError) {
-        const diag = {
-          cwdExists: cwd ? fs.existsSync(cwd) : true,
-          executableExists,
-          safeOsEnvPresent,
-          error: spawnError.message
-        };
-        const err = new SwitchFault('SPAWN_FAILED', `Process spawn failed: ${spawnError.message}`);
-        err.cause = spawnError;
-        err.diagnostics = diag;
-        throw err;
-      }
-
-      // Inspect newly launched process using audited helper if available
-      let verifiedExe = command;
-      let verifiedStart = spawnStartedIso;
-      let verifiedFt = '0';
-      let verifiedLocalPort = null;
-      let verifiedHealthURL = null;
-
-      if (scriptPath && fs.existsSync(scriptPath)) {
-        // tunnel-client binds its ephemeral health listener asynchronously. A
-        // short post-spawn probe can observe a live process before the listener
-        // exists, persist no healthURL, and make the later evidence gate fail
-        // with HEALTH_URL_REQUIRED. Poll the audited helper for a bounded
-        // window so process ownership and the health endpoint are recorded
-        // together before this process becomes managed.
-        const inspectDeadline = Date.now() + 10000;
-        while (Date.now() < inspectDeadline) {
-          try {
-            const inspected = await executeHelper('Inspect', { ProcessId: child.pid, service });
-            const p = inspected.data || inspected;
-            if (p?.running) {
-              verifiedExe = p.executablePath || verifiedExe;
-              verifiedStart = p.creationDate || verifiedStart;
-              verifiedFt = p.creationTimeFileTime || verifiedFt;
-              if (p.localPort) verifiedLocalPort = p.localPort;
-              if (p.healthURL) verifiedHealthURL = p.healthURL;
-              // A running tunnel without a health URL is not ready to be
-              // managed; keep polling until the listener is observable.
-              if (verifiedHealthURL) break;
-            } else if (p && p.running === false) {
-              break;
-            }
-          } catch (_) {}
-          await new Promise(r => setTimeout(r, 250));
-        }
-      }
-
-      const identity = {
-        running: true,
-        pid: child.pid,
-        processId: child.pid,
-        executablePath: verifiedExe,
-        executable: verifiedExe,
-        startTime: verifiedStart,
-        startedAt: verifiedStart,
-        creationDate: verifiedStart,
-        creationTimeFileTime: verifiedFt,
-        ...(verifiedLocalPort ? { localPort: verifiedLocalPort } : {}),
-        ...(verifiedHealthURL ? { healthURL: verifiedHealthURL } : {}),
-        service,
-        command,
-        args,
-        operationId
-      };
-
-      fs.writeFileSync(getProcessFile(service), JSON.stringify(identity, null, 2), 'utf8');
-      return identity;
+      throw new SwitchFault('PROCESS_PLATFORM_UNSUPPORTED');
     }
   };
 }
@@ -1273,6 +1225,8 @@ class ServiceAdapter {
 
   _buildLaunchTemplate(credential) {
     const cred = normalizeCredential(credential);
+    const targetPlatform = this.paths?.platform || process.platform;
+    const proxy = resolveDefaultProxy(process.env, targetPlatform);
     const command = this.paths?.tunnelClientBin || (process.platform === 'win32' ? 'tunnel-client.exe' : 'tunnel-client');
     let args = [];
 
@@ -1287,7 +1241,7 @@ class ServiceAdapter {
         'run',
         '--profile', 'overleaf',
         '--health.listen-addr', listenAddr,
-        '--http-proxy', DEFAULT_PROXY,
+        '--http-proxy', proxy,
         '--control-plane.poll-timeout', '10s',
         '--control-plane.initial-poll-timeout', '100ms'
       ];
@@ -1296,7 +1250,7 @@ class ServiceAdapter {
         'run',
         '--profile', 'antigravity-local',
         '--health.listen-addr', listenAddr,
-        '--http-proxy', DEFAULT_PROXY,
+        '--http-proxy', proxy,
         '--control-plane.poll-timeout', '10s',
         '--control-plane.initial-poll-timeout', '100ms'
       ];
@@ -1309,13 +1263,23 @@ class ServiceAdapter {
         'run',
         '--profile', profileName,
         '--health.listen-addr', listenAddr,
-        '--http-proxy', DEFAULT_PROXY,
+        '--http-proxy', proxy,
         '--control-plane.poll-timeout', '10s',
         '--control-plane.initial-poll-timeout', '100ms'
       ];
       if (cred.organizationId) {
         args.push('--control-plane.organization-id', cred.organizationId);
       }
+    }
+
+    if (!proxy) {
+      const proxyAt = args.indexOf('--http-proxy');
+      if (proxyAt >= 0) args.splice(proxyAt, 2);
+    }
+    if (targetPlatform === 'darwin') {
+      const profileAt = args.indexOf('--profile');
+      if (profileAt >= 0) args.splice(profileAt, 2);
+      args.push('--profile-file', path.resolve(this.configPath));
     }
 
     const customEnv = {};
@@ -1348,12 +1312,12 @@ class ServiceAdapter {
       command,
       args,
       cwd: this.paths?.cwd || this.paths?.tunnelHome || this.paths?.userProfile || process.cwd(),
-      proxy: DEFAULT_PROXY,
+      proxy,
       serviceMcpEnv: {
         ...customEnv,
-        HTTP_PROXY: DEFAULT_PROXY,
-        HTTPS_PROXY: DEFAULT_PROXY,
-        ALL_PROXY: DEFAULT_PROXY
+        HTTP_PROXY: proxy,
+        HTTPS_PROXY: proxy,
+        ALL_PROXY: proxy
       },
       healthURL: this.healthURL
     };
@@ -1654,18 +1618,15 @@ class ServiceAdapter {
         }
       }
       const serviceEnv = {
-        HTTP_PROXY: DEFAULT_PROXY,
-        HTTPS_PROXY: DEFAULT_PROXY,
-        ALL_PROXY: DEFAULT_PROXY,
+        HTTP_PROXY: template.proxy ?? DEFAULT_PROXY,
+        HTTPS_PROXY: template.proxy ?? DEFAULT_PROXY,
+        ALL_PROXY: template.proxy ?? DEFAULT_PROXY,
         ...customEnv
       };
       // Build complete child env using GPT-approved buildTunnelLaunchEnvironment:
       // inherited base (safe pinned), service env, CP credentials LAST, httpPlan for MCP vars.
       explicitEnv = buildTunnelLaunchEnvironment({
-        inheritedEnvironment: buildSafePinnedEnv({
-          ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
-          ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-        }, { codexBridgeEnabled: this.codexBridgeEnabled }),
+        inheritedEnvironment: buildSafePinnedEnv(platformProfileEnvironment(this.paths), { codexBridgeEnabled: this.codexBridgeEnabled }),
         serviceEnvironment: serviceEnv,
         controlPlaneEnvironment: { CONTROL_PLANE_API_KEY: snapshot.credential.apiKey },
         httpPlan: snapshot.desiredPlan
@@ -1685,16 +1646,13 @@ class ServiceAdapter {
       }
       const serviceEnv = {
         ...customEnv,
-        HTTP_PROXY: DEFAULT_PROXY,
-        HTTPS_PROXY: DEFAULT_PROXY,
-        ALL_PROXY: DEFAULT_PROXY
+        HTTP_PROXY: template.proxy ?? DEFAULT_PROXY,
+        HTTPS_PROXY: template.proxy ?? DEFAULT_PROXY,
+        ALL_PROXY: template.proxy ?? DEFAULT_PROXY
       };
       // Build complete child env using buildTunnelLaunchEnvironment (stdio path, no httpPlan).
       explicitEnv = buildTunnelLaunchEnvironment({
-        inheritedEnvironment: buildSafePinnedEnv({
-          ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
-          ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-        }, { codexBridgeEnabled: this.codexBridgeEnabled }),
+        inheritedEnvironment: buildSafePinnedEnv(platformProfileEnvironment(this.paths), { codexBridgeEnabled: this.codexBridgeEnabled }),
         serviceEnvironment: serviceEnv,
         controlPlaneEnvironment: { CONTROL_PLANE_API_KEY: snapshot.credential.apiKey }
       });
@@ -1987,14 +1945,11 @@ class ServiceAdapter {
           const cpEnv = {};
           if (snapshot.credential?.apiKey) cpEnv.CONTROL_PLANE_API_KEY = snapshot.credential.apiKey;
           restoredEnv = buildTunnelLaunchEnvironment({
-            inheritedEnvironment: buildSafePinnedEnv({
-              ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
-              ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-            }, { codexBridgeEnabled: this.codexBridgeEnabled }),
+            inheritedEnvironment: buildSafePinnedEnv(platformProfileEnvironment(this.paths), { codexBridgeEnabled: this.codexBridgeEnabled }),
             serviceEnvironment: {
-              HTTP_PROXY: DEFAULT_PROXY,
-              HTTPS_PROXY: DEFAULT_PROXY,
-              ALL_PROXY: DEFAULT_PROXY
+              HTTP_PROXY: template.proxy ?? DEFAULT_PROXY,
+              HTTPS_PROXY: template.proxy ?? DEFAULT_PROXY,
+              ALL_PROXY: template.proxy ?? DEFAULT_PROXY
             },
             controlPlaneEnvironment: cpEnv,
             httpPlan: origPlan
@@ -2004,17 +1959,14 @@ class ServiceAdapter {
           // Build complete restored env using buildTunnelLaunchEnvironment (stdio path).
           const restoredServiceEnv = {
             ...template.serviceMcpEnv,
-            HTTP_PROXY: DEFAULT_PROXY,
-            HTTPS_PROXY: DEFAULT_PROXY,
-            ALL_PROXY: DEFAULT_PROXY
+            HTTP_PROXY: template.proxy ?? DEFAULT_PROXY,
+            HTTPS_PROXY: template.proxy ?? DEFAULT_PROXY,
+            ALL_PROXY: template.proxy ?? DEFAULT_PROXY
           };
           const cpEnv = {};
           if (snapshot.credential?.apiKey) cpEnv.CONTROL_PLANE_API_KEY = snapshot.credential.apiKey;
           restoredEnv = buildTunnelLaunchEnvironment({
-            inheritedEnvironment: buildSafePinnedEnv({
-              ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
-              ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-            }, { codexBridgeEnabled: this.codexBridgeEnabled }),
+            inheritedEnvironment: buildSafePinnedEnv(platformProfileEnvironment(this.paths), { codexBridgeEnabled: this.codexBridgeEnabled }),
             serviceEnvironment: restoredServiceEnv,
             controlPlaneEnvironment: cpEnv
           });
@@ -2088,7 +2040,7 @@ class ServiceAdapter {
         tunnelId: maskTunnelId(parsed.tunnelId),
         hasApiKey: Boolean(parsed.apiKey),
         organizationId: parsed.organizationId || null,
-        proxy: DEFAULT_PROXY,
+        proxy: resolveDefaultProxy(process.env, this.paths?.platform || process.platform),
         configPath: this.configPath
       }
     };
@@ -2221,18 +2173,23 @@ class ServiceAdapter {
  * -> {'overleaf-mcp': adapter, 'antigravity-mcp': adapter} or custom definitions
  */
 export function createAdapters(options = {}) {
-  const dataDir = options.dataDir || path.join(process.env.LOCALAPPDATA || userProfilePath('AppData', 'Local'), 'McpTunnelAccountManager');
-  const userProfile = options.paths?.userProfile || process.env.USERPROFILE || userProfilePath();
-  const appData = options.paths?.appData || process.env.APPDATA || path.join(userProfile, 'AppData', 'Roaming');
+  const defaults = resolvePlatformPaths({ platform: options.platform || options.paths?.platform || process.platform,
+    home: options.paths?.userProfile, env: options.paths?.userProfile ? { ...process.env, USERPROFILE: options.paths.userProfile } : process.env });
+  const dataDir = options.dataDir || defaults.dataDir;
+  const userProfile = options.paths?.userProfile || defaults.userProfile;
+  const appData = options.paths?.appData || defaults.appData;
   const tunnelHome = options.paths?.tunnelHome || path.join(userProfile, '.openai-tunnel');
+  const tunnelConfigDir = options.paths?.tunnelConfigDir || path.join(appData, 'tunnel-client');
 
   const resolvedPaths = {
+    ...defaults,
     userProfile,
     appData,
     tunnelHome,
-    tunnelClientBin: path.join(tunnelHome, 'tunnel-client.exe'),
-    overleafConfigPath: path.join(appData, 'tunnel-client', 'overleaf.yaml'),
-    antigravityConfigPath: path.join(appData, 'tunnel-client', 'antigravity-local.yaml'),
+    tunnelConfigDir,
+    tunnelClientBin: path.join(tunnelHome, defaults.platform === 'win32' ? 'tunnel-client.exe' : 'tunnel-client'),
+    overleafConfigPath: path.join(tunnelConfigDir, 'overleaf.yaml'),
+    antigravityConfigPath: path.join(tunnelConfigDir, 'antigravity-local.yaml'),
     overleafEnvPath: path.join(tunnelHome, 'tunnel.env'),
     overleafHealthURL: options.paths?.overleafHealthURL || options.healthURLs?.['overleaf-mcp'] || options.healthURL || null,
     antigravityHealthURL: options.paths?.antigravityHealthURL || options.healthURLs?.['antigravity-mcp'] || options.healthURL || null,
@@ -2244,7 +2201,10 @@ export function createAdapters(options = {}) {
     dataDir,
     scriptPath,
     runtimeCommand: options.runtimeCommand,
-    paths: resolvedPaths
+    paths: resolvedPaths,
+    platform: defaults.platform,
+    processReader: options.processReader,
+    posixOptions: options.posixOptions
   });
 
   const probe = options.probe !== undefined ? options.probe : defaultTunnelProbe;

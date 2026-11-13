@@ -1,11 +1,8 @@
-// Local run helper for the parallel-instance console.
-// Same as scripts/launch-manager.mjs but points the adapter at the existing
-// tunnel-client binary that ships with D:\MCP, because this checkout has no
-// bundle package-manifest.json to auto-resolve it. Reads PORT / DATA_DIR /
-// TUNNEL_CLIENT_BIN from the environment. Does not modify any project code.
-import { getLaunchOptions, run as _unused } from './launch-manager.mjs';
+// Reads PORT / DATA_DIR / TUNNEL_CLIENT_BIN without assuming a Windows drive.
+import { getLaunchOptions } from './launch-manager.mjs';
+import { resolvePlatformPaths } from '../src/core/platform-paths.mjs';
 
-const TUNNEL_CLIENT_BIN = process.env.TUNNEL_CLIENT_BIN || 'D:\\MCP\\tunnel-client\\tunnel-client.exe';
+const TUNNEL_CLIENT_BIN = process.env.TUNNEL_CLIENT_BIN || resolvePlatformPaths().tunnelClientBin;
 
 async function main() {
   const base = getLaunchOptions(process.env);
