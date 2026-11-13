@@ -1,343 +1,392 @@
+<div align="center">
+
 # MCP Tunnel Account Manager
 
-Windows 本地 MCP 隧道与账号管理控制台：用浏览器管理多个账号、多个 MCP 服务与各自的 tunnel-client 隧道，凭据加密保存在本机。
+### 多个账号、多种 MCP，一个 Windows 本地控制台。
 
-本 README 面向**第一次使用的新手**，按顺序做完即可：安装依赖 → 启动控制台 → 在网页里填自己的 Tunnel ID 与 Runtime API Key → 启动隧道。
+在浏览器里管理账号配置、切换服务、并行启动隧道。  
+把 Overleaf 写作与 Antigravity Agent 接入同一套管理入口，让日常使用少一点重复配置。
 
-> 本仓库 `final` 分支为综合合并版。旧的 `v1.2.0-preview.*` 二进制发行包与 `deployment/windows` 目录属于**历史发布物**，不是当前的安装方式，见文末「历史版本」。
+[![GitHub Stars](https://img.shields.io/github/stars/zwsxzy/mcp-tunnel-account-manager?style=flat-square)](https://github.com/zwsxzy/mcp-tunnel-account-manager/stargazers)
+![Windows 10 / 11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?style=flat-square)
+![Node.js 22.14+](https://img.shields.io/badge/Node.js-22.14%2B-339933?style=flat-square)
+![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square)
 
----
+**[下载 final 源码](https://github.com/zwsxzy/mcp-tunnel-account-manager/archive/refs/heads/final.zip) · [快速开始](#quick-start) · [配置指南](#configuration) · [反馈问题](https://github.com/zwsxzy/mcp-tunnel-account-manager/issues)**
 
-## 1. 快速开始（本次 final 源码）
+</div>
+
+> 如果这个项目帮你省去了反复配置和切换的麻烦，欢迎点亮右上角 **⭐ Star**，让更多有同样需求的人发现它。
+
+## 为什么做这个项目
+
+用上多个 MCP 之后，麻烦往往来自日常管理：这个服务用哪个账号、那个隧道读哪份配置、换一套环境又要改哪些路径。
+
+MCP Tunnel Account Manager 把这些操作集中到一个本地网页里。**保存好配置，选择要运行的服务与账号，再执行切换或并行启动。**
+
+| 你想做的事 | 项目提供的能力 |
+| --- | --- |
+| 在多套账号配置之间切换 | 保存命名配置，按服务填写凭据，在页面中选择并切换 |
+| 同时运行不同账号或多个 MCP | 多选服务与配置，使用并行启动；各运行实例使用独立的 Tunnel ID |
+| 接入 Overleaf 和 Antigravity | 内置两个服务定义，提供固定版本的组件安装脚本 |
+| 少手工编辑配置文件 | 在网页中管理程序路径、参数、环境变量，查看运行状态和错误信息 |
+| 把配置留在自己的电脑上 | 控制台默认只监听本机地址，账号凭据加密保存在本机数据目录 |
+
+**适合你，如果你正在：**
+
+- 在 Windows 上使用 Overleaf MCP、Antigravity MCP，想集中管理它们的隧道。
+- 为不同用途维护多套账号配置，希望切换和并行运行更方便。
+- 第一次接触 MCP，希望从安装脚本和可视化页面开始上手。
+
+**当前使用入口是 `final` 分支。** 本文对应这套源码；旧的 `v1.2.0-preview.*` 发行包与迁移工具说明放在[历史版本](#history)，请按本文的当前安装流程使用。
+
+## 导航
+
+[快速开始](#quick-start) · [第一次配置](#configuration) · [三个组件](#components) · [安装路径](#paths) · [进阶设置](#advanced) · [常见问题](#faq) · [验证记录](#validation) · [参与项目](#contributing)
+
+<a id="quick-start"></a>
+
+## 快速开始
+
+### 1. 准备运行环境
+
+| 环境 | 要求 |
+| --- | --- |
+| 系统 | Windows 10 / 11 x64，系统自带的 Windows PowerShell 5.1 |
+| Node.js | **22.14.0 或更高版本** |
+| Python | **3.9 或更高版本**，推荐 3.12；安装时勾选加入 PATH |
+| 网络 | 首次安装需要访问 GitHub 与 npm registry |
+
+按需要准备：Overleaf 的 Git 读写 / 同步需要 **Git for Windows**，本地编译需要 **TeX / latexmk**；Antigravity 的原生 Agent 功能需要 **已安装、已登录并正在运行的 Antigravity IDE**。
+
+一键安装脚本负责安装下面三个组件；Node.js、Python 和 IDE 等基础环境需要先准备好。控制台自身没有第三方 npm 运行依赖，启动前无需执行 `npm install`。
+
+### 2. 下载项目，安装组件
+
+**[点击下载 final 分支 ZIP](https://github.com/zwsxzy/mcp-tunnel-account-manager/archive/refs/heads/final.zip)**，解压后进入包含 `Install-Components.cmd` 的项目根目录。
+
+也可以用 Git 获取：
+
+```powershell
+git clone --branch final --single-branch https://github.com/zwsxzy/mcp-tunnel-account-manager.git
+cd mcp-tunnel-account-manager
+```
+
+双击 **`Install-Components.cmd`**，安装 `tunnel-client`、`overleaf-mcp` 和 `antigravity-mcp`。安装到当前用户目录，无需管理员权限。
+
+### 3. 打开控制台
+
+双击 **`Start-Console.cmd`**，浏览器会打开：
+
+**<http://127.0.0.1:17642>**
+
+首次进入时，按提示输入引导码并设置管理员密码。引导码文件位于：
 
 ```text
-1) 双击根目录 Install-Components.cmd        （安装三个外部组件，只需一次）
-2) 双击根目录 Start-Console.cmd              （启动控制台并打开浏览器）
-3) 在 http://127.0.0.1:17642 按页面提示初始化管理员密码
-4) 在「账号配置」里为每个 MCP 服务填写自己的 Tunnel ID 与 Runtime API Key
+%LOCALAPPDATA%\McpTunnelAccountManager\bootstrap-code.txt
 ```
 
-命令行等价写法：
+初始化完成后，用管理员密码登录，继续下面的[第一次配置](#configuration)。引导码和个人凭据请只保留在自己的电脑上。
+
+<details>
+<summary>习惯用终端？等价命令在这里</summary>
+
+在项目根目录打开 PowerShell：
 
 ```powershell
+# 安装三个组件
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-components.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\open-portable-console.ps1
-```
 
----
-
-## 2. 前提条件
-
-| 项目 | 要求 | 是否由安装脚本准备 |
-| --- | --- | --- |
-| 操作系统 | Windows 10/11 x64 | 否 |
-| PowerShell | 系统自带 Windows PowerShell 5.1 | 否 |
-| 浏览器 | Edge / Chrome 等现代浏览器 | 否 |
-| Node.js | **>= 22.14.0**（`mcp-server-overleaf@0.3.9` 的 engines 要求） | 否，需自行安装 |
-| Python | **>= 3.9**，推荐 3.12（安装时勾选 Add to PATH） | 否，需自行安装 |
-| 网络 | 首次安装需访问 GitHub 与 npm registry | — |
-| Git for Windows | 仅当需要 Overleaf 的 Git 读写/同步时才需要 | 否，仓库不捆绑 |
-| TeX / latexmk | 仅当需要本地编译 Overleaf 项目时才需要 | 否，仓库不捆绑 |
-| Antigravity IDE | 使用 Antigravity MCP 时必须已安装、已登录并正在运行 | 否 |
-
-控制台自身**没有第三方 npm 运行依赖**（`package.json` 无 `dependencies` 字段），不需要 `npm install` 就能启动。
-
----
-
-## 3. 一键安装三个外部组件
-
-### 3.1 入口
-
-| 方式 | 命令 |
-| --- | --- |
-| 双击（推荐新手） | `Install-Components.cmd` |
-| 全部安装 | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-components.ps1` |
-| 只装 tunnel-client | `.\scripts\install-tunnel-client.ps1` |
-| 只装 overleaf-mcp | `.\scripts\install-overleaf-mcp.ps1` |
-| 只装 antigravity-mcp | `.\scripts\install-antigravity-mcp.ps1` |
-| 只检查不安装 | 加 `-VerifyOnly` |
-| 强制重装 | 加 `-Force` |
-
-也可以只装其中几项：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-components.ps1 -Component overleaf-mcp,antigravity-mcp
-```
-
-### 3.2 脚本行为
-
-- 只写入**当前用户目录**，不需要管理员权限，不修改系统级环境变量。
-- 固定版本 + 校验：tunnel-client 校验 SHA256，overleaf-mcp 校验 npm integrity，antigravity-mcp 校验源码归档 SHA256 并记录 commit。
-- 可重复运行：已安装同版本会跳过下载；`-Force` 才会重新覆盖。
-- **不会删除** `%USERPROFILE%\.openai-tunnel` 里已有的 `tunnel.env`、启动脚本或其他个人文件，只覆盖发行包内的程序与伴随资源。
-- 失败时以**非零退出码**结束，并打印具体原因；已完成的组件下次会自动跳过。
-- 下载缓存与安装状态都留在本机用户目录，便于离线重装与排查。
-
-### 3.3 安装路径
-
-| 内容 | 默认路径 |
-| --- | --- |
-| tunnel-client 程序 | `%USERPROFILE%\.openai-tunnel\tunnel-client.exe` |
-| cloudflared 伴随程序 | `%USERPROFILE%\.openai-tunnel\cloudflared.exe` |
-| Overleaf MCP 运行目录 | `%USERPROFILE%\.overleaf-mcp\runtime\node_modules\mcp-server-overleaf` |
-| Antigravity MCP 虚拟环境 | `%USERPROFILE%\.antigravity-mcp\venv\Scripts\python.exe` |
-| Antigravity MCP 源码（固定 commit） | `%USERPROFILE%\.antigravity-mcp\app` |
-| Overleaf 隧道配置 | `%APPDATA%\tunnel-client\overleaf.yaml` |
-| Antigravity 隧道配置 | `%APPDATA%\tunnel-client\antigravity-local.yaml` |
-| 安装状态记录 | `%USERPROFILE%\.mcp-tunnel-kit\install-state.json` |
-| 下载缓存 | `%USERPROFILE%\.mcp-tunnel-kit\cache` |
-| 控制台数据目录 | `%LOCALAPPDATA%\McpTunnelAccountManager` |
-| Antigravity MCP 状态目录 | 默认 `%LOCALAPPDATA%\antigravity-mcp`；安装器**不会**自动隔离，建议按下文 6.3 显式指定独立目录 |
-
-这些路径与控制台代码里的默认值一致，所以安装完不需要再手工改路径。
-
-### 3.4 依赖来源（固定版本）
-
-| 组件 | 来源 | 版本 |
-| --- | --- | --- |
-| tunnel-client | `openai/tunnel-client` | **v0.0.19**（固定兼容版本，非最新版；上游最新为 v0.0.20） |
-| overleaf-mcp | npm `mcp-server-overleaf`（上游 `yangzichao/mcp-server-overleaf`，MIT） | **0.3.9** |
-| antigravity-mcp | `https://github.com/zwsxzy/antigravity-mcp-fork` | commit `02df3ed95aae0c5103f5db7b332d0c4e6f1eec50`，包版本 `1.1.0.post1` |
-
-antigravity-mcp 的 `dependencies = []`（纯标准库），因此安装器**不做 pip 构建**：它把固定 commit 的源码放进 `.antigravity-mcp\app`，由独立 venv 通过 `.pth` 引用，避免在线构建依赖。
-
-### 3.5 卸载
-
-安装器不提供自动卸载。需要清理时，手动删除上表中对应的目录即可；**删除前请先备份** `%APPDATA%\tunnel-client\*.yaml` 与 `%LOCALAPPDATA%\McpTunnelAccountManager`（账号库、密钥、日志都在后者）。
-
----
-
-## 4. 启动控制台
-
-```powershell
-# 后台启动并自动打开浏览器
+# 后台启动控制台并打开浏览器
 .\Start-Console.cmd
 
-# 前台调试模式（Ctrl+C 结束）
+# 或以前台模式启动，方便查看输出；Ctrl+C 结束
 .\start-manager.cmd
 ```
 
-- 地址：<http://127.0.0.1:17642>，只监听本机回环地址。
-- 可用环境变量 `PORT` 改端口；`HOST` 只允许 `127.0.0.1`，填其他值会拒绝启动。
-- 数据目录默认 `%LOCALAPPDATA%\McpTunnelAccountManager`，可用 `DATA_DIR` 覆盖。
-- **首次初始化**：页面会要求「引导秘钥 (Bootstrap Code)」+ 管理员密码。引导秘钥在数据目录下的 `bootstrap-code.txt` 里。这个文件只在本机，**不要公开、不要提交、不要截图分享**。
-- 初始化完成后用管理员密码登录。
+</details>
 
----
+<a id="configuration"></a>
 
-## 5. 新手配置（按 Web 界面操作）
+## 第一次配置：在网页里完成
 
-### 5.1 先理解两个页面
+### 先分清两个页面
 
-| 页面 | 作用 |
+| 页面 | 管理什么 |
 | --- | --- |
-| **账号配置** | 一个「配置」= 一套账号凭据。为每个 MCP 服务分别填 Tunnel ID / API Key / Organization ID。 |
-| **MCP 服务** | 本机 MCP 服务的注册表：程序路径、参数、工作目录、环境变量、运行状态。 |
+| **账号配置** | 账号名称，以及每个 MCP 服务对应的 Tunnel ID、Runtime API Key、Organization ID |
+| **MCP 服务** | 本机服务的可执行文件、启动参数、工作目录、环境变量与运行状态 |
 
-控制台**已内置并启用** `overleaf-mcp` 与 `antigravity-mcp` 两个服务定义。新手**不需要**在「MCP 服务」页重新添加这两个服务，只要在「账号配置」里填凭据即可。
+控制台已内置并启用 **`overleaf-mcp`** 与 **`antigravity-mcp`**。使用默认安装位置时，可以直接配置账号凭据，无需重新添加这两个服务。
 
-### 5.2 账号配置页
+使用 Overleaf 项目功能前，还需要完成下方的[项目配置向导](#overleaf-setup)；使用 Antigravity 原生 Agent 功能时，请保持 IDE 已登录并运行。
 
-1. 打开「账号配置」标签页，点右上角 **「添加新配置」**。
-2. 填 **「配置标签 / 名称」**，例如 `我的主力账号`。
-3. 下方会为每个已注册的 MCP 服务显示一块凭据表单，逐项填写：
+### 添加自己的账号配置
 
-| 字段 | 必填 | 说明 |
+1. 打开 **「账号配置」**，点击 **「添加新配置」**。
+2. 填写便于识别的名称，例如 `论文工作区` 或 `日常开发`。
+3. 为要使用的 MCP 服务填写以下字段，然后点击 **「保存配置」**。
+
+| 字段 | 填写内容 |
+| --- | --- |
+| **Tunnel ID** | 在 [OpenAI Tunnels 页面](https://platform.openai.com/settings/organization/tunnels)创建或查看该服务的隧道 ID |
+| **API Key** | 在 [OpenAI API Keys 页面](https://platform.openai.com/settings/organization/api-keys)创建对应的 **Runtime API Key** |
+| **Organization ID** | 可选，按自己的账号情况填写 |
+
+需要具备相应的 Tunnels 权限；角色与权限要求可查阅 [tunnel-client 官方说明](https://github.com/openai/tunnel-client/blob/v0.0.19/docs/permissions.md)。
+
+**同时在线的不同电脑、服务或并行实例，应使用各自独立的 Tunnel ID。** 安装器会生成配置模板，真实凭据由你在控制台填写。
+
+编辑已有配置时，API Key 留空表示保留原值。页面上的脱敏值用于展示，请勿把 `tun_***4a5` 这类脱敏文本填回输入框。
+
+### 启动、切换与并行运行
+
+启动隧道前请确认代理设置：未设置代理环境变量时，当前默认使用 `http://127.0.0.1:7897`，详见[进阶设置](#advanced)。
+
+1. 在 **「账号配置」** 页选择 **「1. 选择目标生效服务」**。
+2. 选择 **「2. 选择待激活配置文件」**。
+3. 点击 **「3. 执行原子切换」**；需要同时运行多套配置时，使用 **「并行启动」**。
+4. 查看页面显示的状态与错误信息；需要停止时使用 **「停止全部 Tunnel Client」**。
+
+切换流程包含失败回滚处理。若操作失败，请根据页面错误信息排查后再重试。
+
+<a id="components"></a>
+
+## 三个组件，各自负责什么
+
+| 组件 | 职责 | 本项目固定安装版本 |
 | --- | --- | --- |
-| **Tunnel ID** | 是 | 在 OpenAI 控制台为这个隧道创建的 ID，形如 `tun_xxxxxxxxxxxxxxxx`。每台电脑、每个服务建议用**不同**的 Tunnel ID。 |
-| **API Key** | 是 | 该隧道的 Runtime API Key。编辑已有配置时留空表示保留原值。 |
-| **Organization ID** | 否 | 只有你的账号属于某个组织时才需要填。 |
+| [tunnel-client](https://github.com/openai/tunnel-client) | 将本机 MCP 服务连接到 OpenAI 隧道 | `v0.0.19`，固定兼容版本 |
+| [Overleaf MCP](https://github.com/yangzichao/mcp-server-overleaf) | 提供 Overleaf 项目相关 MCP 工具 | `mcp-server-overleaf@0.3.9` |
+| [Antigravity MCP fork](https://github.com/zwsxzy/antigravity-mcp-fork) | 将 Antigravity IDE 的本地 Agent 能力提供为 MCP 工具 | `1.1.0.post1`，固定提交 [`02df3ed`](https://github.com/zwsxzy/antigravity-mcp-fork/commit/02df3ed95aae0c5103f5db7b332d0c4e6f1eec50) |
 
-4. 点 **「保存配置」**。
+### tunnel-client：连接本机服务与隧道
 
-> 凭据只保存在本机加密库里。界面显示的是脱敏值（如 `tun_***4a5`），**不要把脱敏值复制回输入框**，否则会被当成真实值。
+安装器会在 `%APPDATA%\tunnel-client\` 生成两个服务的 YAML 模板，`tunnel_id` 初始留空，执行切换时由控制台写入真实值。
 
-### 5.3 执行切换 / 启动隧道
+已有配置的程序路径失效时，安装器会修复到当前安装位置；若原命令仍有效但与本次安装不同，会保留原配置并生成 `*.yaml.suggested` 供你对照。
 
-1. 在「账号配置」页选择 **1. 选择目标生效服务**（可多选）。
-2. 选择 **2. 选择待激活配置文件**（可多选，用于并行启动）。
-3. 点 **3. 执行原子切换**；需要同时跑多个账号时用 **「并行启动」**。
-4. 需要全部停止时点 **「停止全部 Tunnel Client」**。
+<a id="overleaf-setup"></a>
 
-切换是原子操作：失败会回滚到切换前的配置，并在界面上显示错误码。
+### Overleaf MCP：先配置自己的项目
 
-### 5.4 MCP 服务页（只有新增自定义服务时才需要）
-
-点 **「添加 MCP 服务」**，字段如下：
-
-| 字段 | 说明 |
-| --- | --- |
-| **服务名称 / 标签** | 显示名称 |
-| **服务类型** | stdio（本地进程）或 HTTP/SSE（远程地址） |
-| **本机可执行文件路径或系统命令** | 例如 `C:\Program Files\nodejs\node.exe`、`python`、`npx.cmd` |
-| **运行工作目录 (cwd)** | 选填 |
-| **启动命令行参数 (Arguments)** | 逐个添加 |
-| **HTTP URL 地址** | 仅 HTTP/SSE 类型 |
-| **HTTP 请求头 (Headers)** | 仅 HTTP/SSE 类型 |
-| **环境变量列表** | 传给该 MCP 子进程的环境变量 |
-
-> **重要限制**：环境变量列表里**不允许** `CONTROL_PLANE_*` 与 `TUNNEL_CLIENT_*` 前缀（后端会拒绝）。Tunnel 凭据请走「账号配置」，程序路径请走服务定义或启动器设置，不要写进服务 env。
-
-「发现本机配置」可以扫描本机已有的 MCP 配置并导入预览。
-
----
-
-## 6. 三个组件分别怎么配
-
-### 6.1 tunnel-client
-
-- 作用：把本地 stdio MCP 服务桥接到 OpenAI 隧道，是三个服务共用的隧道程序。
-- 安装位置：`%USERPROFILE%\.openai-tunnel\tunnel-client.exe`（同目录还有 `cloudflared.exe`、manifest 与许可证）。
-- 需要你准备：**Tunnel ID** 与 **Runtime API Key**（在 OpenAI 控制台创建隧道时获得），填在「账号配置」页。
-- 隧道配置文件由安装器生成在 `%APPDATA%\tunnel-client\`，其中 `tunnel_id` 故意留空，切换时由控制台写入真实值。
-- 如果配置文件里的 MCP 命令指向了不存在的程序，安装器会把它改成当前安装路径；如果命令指向的程序仍然存在但与本次安装不同，安装器**不会**擅自改动，而是生成 `*.yaml.suggested` 供你对照。
-
-### 6.2 overleaf-mcp
-
-- 作用：Overleaf 论文编辑与追踪的 MCP 服务，stdio 传输，由 tunnel-client 桥接。
-- 安装位置：`%USERPROFILE%\.overleaf-mcp\runtime\node_modules\mcp-server-overleaf`，入口 `dist/index.js`。
-- 需要你准备：该服务的 **Tunnel ID** 与 **Runtime API Key**（填在「账号配置」页）。
-- 项目配置：上游 `mcp-server-overleaf` 提供交互式向导
-
-  ```powershell
-  npx --yes mcp-server-overleaf@0.3.9 setup --clients none
-  ```
-
-  `--clients none` 表示**不为其他 MCP 客户端写配置**，只准备 Overleaf 自己的项目配置。在 Windows 上它会读取 `XDG_CONFIG_HOME` / `APPDATA`，把项目清单写到 `overleaf-mcp\projects.json`。
-- 服务运行时可用 `OVERLEAF_PROJECTS_CONFIG` 指定具体的 `projects.json`；但**不要假设 setup 向导会遵从该环境变量**，向导写的是它自己的默认位置。
-- 默认业务工作区：`%USERPROFILE%\.overleaf-mcp\projects`，可用 `OVERLEAF_MCP_WORKSPACE_DIR` 指定。
-- **两种凭据不要混淆**：
-  - **Runtime API Key**：OpenAI 隧道的凭据，填在控制台「账号配置」。
-  - **个人 Git token**：Overleaf 项目 Git 读写/同步用的凭据，由 Overleaf 侧配置，与隧道无关。
-- 只有需要本地编译时才要装 TeX/latexmk；只有需要 Git 同步时才要装 Git for Windows。
-
-### 6.3 antigravity-mcp
-
-- 作用：把 Antigravity IDE 的本地 agent 引擎暴露为 MCP 工具，stdio 传输，由 tunnel-client 桥接。
-- 来源固定：`https://github.com/zwsxzy/antigravity-mcp-fork`，commit `02df3ed95aae0c5103f5db7b332d0c4e6f1eec50`，版本 `1.1.0.post1`。
-- 安装位置：venv 在 `%USERPROFILE%\.antigravity-mcp\venv`，源码在 `%USERPROFILE%\.antigravity-mcp\app`。
-- 启动命令（安装器写入 YAML）：
-
-  ```text
-  "<venv>\Scripts\python.exe" -X utf8 -u -m antigravity_mcp
-  ```
-
-  `-X utf8 -u` 保证中文输入输出不被 Windows 默认编码破坏。
-- 状态目录：默认 `%LOCALAPPDATA%\antigravity-mcp`（任务历史需要跨进程保留）。
-  - 安装器**不会**自动把状态目录改到 `.antigravity-mcp` 下；安装状态文件里记录的 `stateDir` 就是上游默认值 `%LOCALAPPDATA%\antigravity-mcp`。
-  - 如果你同时装了上游 `antigravity-mcp`，或者希望每个账号/环境互不干扰，建议显式指定独立目录：
-    1. 打开「MCP 服务」页，编辑 `antigravity-mcp` 服务；
-    2. 在 **环境变量列表** 里新增一条，名称为 `ANTIGRAVITY_STATE_DIR`，值为**绝对路径**，例如 `C:\Users\你的用户名\.antigravity-mcp\state`（环境变量值不会展开 `%USERPROFILE%`，必须写完整路径）；
-    3. 保存后再执行一次切换，让新环境变量生效。
-  - 不要把它写进 `CONTROL_PLANE_*` / `TUNNEL_CLIENT_*` 前缀（会被拒绝）。
-- **必须**：本机已安装、已登录并**正在运行** Antigravity IDE。fork 的原生多父 / 多 agent 协作依赖 IDE 的本地语言服务器。
-- 如果 IDE 没运行，只能走 Gemini REST API 的 fallback，**该 fallback 不支持原生多 agent 协作**。
-- 只有 stdio，没有 HTTP/SSE。
-- 包内的 `workflow_settings.json` 键值有严格约定，**不要随意修改**（尤其 `default_model`）。
-- 不要用 `--version` 探测这个包（它会等待 stdin）。
-
----
-
-## 7. 安装路径与状态目录总表
-
-| 类别 | 路径 |
-| --- | --- |
-| 控制台源码 | 本仓库目录 |
-| 控制台数据（账号库/密钥/日志） | `%LOCALAPPDATA%\McpTunnelAccountManager` |
-| 首次初始化引导秘钥 | `%LOCALAPPDATA%\McpTunnelAccountManager\bootstrap-code.txt` |
-| tunnel-client 程序 | `%USERPROFILE%\.openai-tunnel\tunnel-client.exe` |
-| Overleaf MCP 运行目录 | `%USERPROFILE%\.overleaf-mcp\runtime` |
-| Overleaf 项目工作区 | `%USERPROFILE%\.overleaf-mcp\projects` |
-| Antigravity MCP venv | `%USERPROFILE%\.antigravity-mcp\venv` |
-| Antigravity MCP 源码 | `%USERPROFILE%\.antigravity-mcp\app` |
-| Antigravity MCP 状态 | `%LOCALAPPDATA%\antigravity-mcp` |
-| 隧道配置 | `%APPDATA%\tunnel-client\overleaf.yaml`、`%APPDATA%\tunnel-client\antigravity-local.yaml` |
-| 安装状态 / 缓存 | `%USERPROFILE%\.mcp-tunnel-kit\` |
-
----
-
-### 7.1 环境变量一览
-
-这些是控制台与其子进程实际读取的环境变量。设置方式：临时会话用 `$env:NAME = "..."`；长期使用在「系统属性 → 环境变量 → 用户变量」里添加，然后重开终端。
-
-| 变量 | 作用域 | 说明 |
-| --- | --- | --- |
-| `PORT` | 控制台 | 监听端口，默认 `17642` |
-| `HOST` | 控制台 | 只允许 `127.0.0.1`，其他值拒绝启动 |
-| `DATA_DIR` | 控制台 | 数据目录覆盖，默认 `%LOCALAPPDATA%\McpTunnelAccountManager` |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 隧道子进程 | 代理地址；都未设置时默认 `http://127.0.0.1:7897` |
-| `OVERLEAF_PROJECTS_CONFIG` | overleaf-mcp 运行 | 指定具体的 `projects.json` 路径（setup 向导不一定遵从） |
-| `OVERLEAF_MCP_WORKSPACE_DIR` | overleaf-mcp 运行 | Overleaf 项目工作区，默认 `%USERPROFILE%\.overleaf-mcp\projects` |
-| `ANTIGRAVITY_STATE_DIR` | antigravity-mcp 运行 | 任务状态目录，默认 `%LOCALAPPDATA%\antigravity-mcp`；需在 MCP 服务 env 里写绝对路径 |
-
-> 上述变量都是**可选**的；不设置时使用代码里的默认值。`CONTROL_PLANE_*` 与 `TUNNEL_CLIENT_*` 不允许出现在 MCP 服务的环境变量列表里。
-
----
-
-## 8. 常见问题
-
-| 现象 | 处理 |
-| --- | --- |
-| 安装报 Node.js 版本过低 | 需要 **>= 22.14.0**，升级后重跑安装脚本。 |
-| 安装报未找到 Python | 安装 Python >= 3.9（推荐 3.12），安装时勾选 Add to PATH，重开终端后重跑。 |
-| 端口 17642 被占用 | 设置环境变量 `PORT` 换端口，或先停掉占用该端口的旧实例。不要按端口批量杀进程。 |
-| 隧道启动失败、提示配置命令不可用 | 重跑对应组件的安装脚本；它会修复指向不存在程序的命令，或生成 `*.yaml.suggested` 供对照。 |
-| 中文用户名 / 路径含空格 | 安装器已按 Windows 引号规则处理，并把 `.pth` 写成纯 ASCII 相对路径；如仍失败，请把完整报错贴出来。 |
-| 需要代理 | 隧道程序使用 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`，未设置时默认 `http://127.0.0.1:7897`。 |
-| 安装脚本退出码非零 | 表示至少一个组件失败；看输出里的 `[FAIL]` 行，修好后重跑，已完成的组件会自动跳过。 |
-| 忘记管理员密码 | 备份后删除 `%LOCALAPPDATA%\McpTunnelAccountManager` 重新初始化（会丢失账号库）。 |
-
----
-
-## 9. 历史版本
-
-以下内容属于**历史发布物**，仅用于查阅旧版本行为，**不是**当前安装方式：
-
-- `v1.2.0-preview.2` ~ `v1.2.0-preview.5` 的 ZIP 发行包（完整部署包 / 控制台便携包 / 源码包）与 `SHA256SUMS.txt`。
-- `deployment/windows/` 目录：早期迁移工具包源码与说明。
-- `packaging/windows/templates/` 下的发行外壳模板。
-
-这些旧包自带 `node_modules`、`tunnel-client.exe` 和旧版 antigravity 源码，**不要**把它们覆盖到当前源码目录，也不要按旧文档的 Node 18 要求准备环境。当前源码的安装方式以本文第 3 节为准。
-
-历史文档入口：
-
-- [v1.2.0-preview.5 发布说明](docs/releases/v1.2.0-preview.5/RELEASE_NOTES.zh-CN.md)
-- [v1.2.0-preview.5 中文部署说明](docs/releases/v1.2.0-preview.5/README-Release.zh-CN.md)
-- [安全切换修复记录](docs/SAFE-SWITCH-FIX.zh-CN.md)
-- [合并版部署与验证边界](docs/NEW-BRANCH-DEPLOY.zh-CN.md)
-
----
-
-## 10. 源码运行与测试
-
-源码运行需要 Node.js **22.14.0+**，控制台没有第三方 npm 运行依赖：
+在 PowerShell 中运行上游提供的项目配置向导：
 
 ```powershell
-npm.cmd start          # 前台启动（等价 node scripts/launch-manager.mjs）
-npm.cmd run test:unit  # 默认单元测试（不含 tests/integration）
+npx --yes mcp-server-overleaf@0.3.9 setup --clients none
+```
+
+`--clients none` 仅准备 Overleaf 项目配置，不向其他 MCP 客户端写入配置。Windows 默认写入 `%APPDATA%\overleaf-mcp\projects.json`；设置了 `XDG_CONFIG_HOME` 时，以该配置根目录为准。
+
+- **Runtime API Key** 用于隧道连接，填写在本项目的「账号配置」中。
+- **Overleaf 个人 Git token** 用于项目 Git 读写与同步，按 Overleaf 向导配置。
+- Git 同步需要 Git for Windows；本地编译需要 TeX / latexmk。
+
+运行服务时可以通过 `OVERLEAF_PROJECTS_CONFIG` 指定项目清单，通过 `OVERLEAF_MCP_WORKSPACE_DIR` 指定项目工作区。前者影响服务读取配置的位置，**不会让 setup 向导自动改写到该位置**。
+
+### Antigravity MCP：连接正在运行的 IDE
+
+请先安装、登录并启动 **Antigravity IDE**。原生多 Agent 协作依赖 IDE 的本地语言服务器；Gemini REST API fallback 不提供原生多 Agent 协作。
+
+安装器使用独立 Python venv，通过 `.pth` 引用固定提交的源码；该包运行依赖为 Python 标准库，无需 pip 构建。YAML 中的启动形式为：
+
+```text
+"<venv>\Scripts\python.exe" -X utf8 -u -m antigravity_mcp
+```
+
+`-X utf8 -u` 用于 UTF-8 编码和无缓冲输出。该 MCP 使用 **stdio** 传输，由 tunnel-client 桥接。
+
+如果希望使用独立的任务状态目录：
+
+1. 打开 **「MCP 服务」**，编辑 `antigravity-mcp`。
+2. 在 **「环境变量列表」** 中添加 `ANTIGRAVITY_STATE_DIR`。
+3. 填写真实的**绝对路径**，例如 `C:\Users\你的用户名\.antigravity-mcp\state`。
+4. 保存后重新执行切换，让新配置生效。
+
+这里的路径需要替换为自己的实际路径，环境变量值不会自动展开 `%USERPROFILE%`。安装器不会自动更改状态目录；默认仍为 `%LOCALAPPDATA%\antigravity-mcp`。
+
+<details>
+<summary>Antigravity 进阶注意事项</summary>
+
+- 安装源码固定为 `02df3ed95aae0c5103f5db7b332d0c4e6f1eec50`，方便复现与排查。
+- 包内 `workflow_settings.json` 有上游约定，尤其不要随意修改 `default_model`。
+- 不要用 `--version` 探测 MCP 是否可用；该入口可能等待标准输入，应使用 MCP 握手检查。
+- 本项目安装的是 MCP 服务，Antigravity IDE 仍需独立安装与登录。
+
+</details>
+
+<a id="paths"></a>
+
+## 安装路径与数据位置
+
+`%USERPROFILE%` 通常类似 `C:\Users\你的用户名`；`%APPDATA%` 和 `%LOCALAPPDATA%` 分别指当前用户的漫游与本地应用数据目录。
+
+| 内容 | 默认位置 |
+| --- | --- |
+| 控制台源码 | 解压后的项目目录 |
+| tunnel-client | `%USERPROFILE%\.openai-tunnel\tunnel-client.exe` |
+| cloudflared 伴随程序 | `%USERPROFILE%\.openai-tunnel\cloudflared.exe` |
+| Overleaf MCP 入口 | `%USERPROFILE%\.overleaf-mcp\runtime\node_modules\mcp-server-overleaf\dist\index.js` |
+| Overleaf 项目工作区 | `%USERPROFILE%\.overleaf-mcp\projects` |
+| Antigravity Python | `%USERPROFILE%\.antigravity-mcp\venv\Scripts\python.exe` |
+| Antigravity MCP 源码 | `%USERPROFILE%\.antigravity-mcp\app` |
+| Antigravity 任务状态 | `%LOCALAPPDATA%\antigravity-mcp`，可在服务环境变量中另行指定 |
+| Overleaf 隧道配置 | `%APPDATA%\tunnel-client\overleaf.yaml` |
+| Antigravity 隧道配置 | `%APPDATA%\tunnel-client\antigravity-local.yaml` |
+| 安装状态与下载缓存 | `%USERPROFILE%\.mcp-tunnel-kit\`，包含 `install-state.json`、`cache` 等 |
+| 控制台账号库、密钥与日志 | `%LOCALAPPDATA%\McpTunnelAccountManager` |
+| 首次初始化引导码 | `%LOCALAPPDATA%\McpTunnelAccountManager\bootstrap-code.txt` |
+
+默认路径与控制台内置配置相匹配。个人凭据、初始化码、真实运行配置和数据目录请留在本机，不要提交到仓库。
+
+<a id="advanced"></a>
+
+## 进阶设置
+
+<details>
+<summary><strong>单独安装、检查与重新安装</strong></summary>
+
+在项目根目录的 PowerShell 中执行：
+
+```powershell
+# 单独安装指定组件
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-tunnel-client.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-overleaf-mcp.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-antigravity-mcp.ps1
+
+# 只检查已安装版本、入口与配置，不下载、不安装
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-components.ps1 -VerifyOnly
+
+# 需要重新安装时，显式使用 -Force
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-components.ps1 -Force
+```
+
+安装器校验 tunnel-client 的 SHA256、Overleaf 的 npm integrity，以及 Antigravity 源码归档的 SHA256，并记录版本与提交。重复运行会跳过已经完成的同版本组件。
+
+重新安装只覆盖组件发行文件，保留 `.openai-tunnel` 中已有的 `tunnel.env`、个人启动脚本及其他用户文件。安装失败会返回非零退出码，可根据 `[FAIL]` 输出修复后重试。
+
+安装器不提供自动卸载。手动删除组件目录前，请备份隧道 YAML、控制台数据目录以及需要保留的项目与任务记录。
+
+</details>
+
+<details>
+<summary><strong>端口、代理与 MCP 环境变量</strong></summary>
+
+控制台变量可在启动前通过 PowerShell 设置，例如 `$env:PORT = "17643"`；长期使用可设置为 Windows 用户环境变量，然后重开终端。
+
+MCP 服务自己的变量，请在 **「MCP 服务 → 编辑 → 环境变量列表」** 中填写，以便控制台明确传给子进程。路径类值使用完整绝对路径。
+
+| 变量 | 用途 |
+| --- | --- |
+| `PORT` | 控制台端口，默认 `17642` |
+| `HOST` | 只允许 `127.0.0.1`，其他值会拒绝启动 |
+| `DATA_DIR` | 覆盖控制台数据目录 |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 隧道子进程的代理设置；均未设置时，当前启动策略默认使用 `http://127.0.0.1:7897` |
+| `OVERLEAF_PROJECTS_CONFIG` | Overleaf 服务读取的 `projects.json`，不改变 setup 向导的默认写入位置 |
+| `OVERLEAF_MCP_WORKSPACE_DIR` | Overleaf 项目工作区 |
+| `ANTIGRAVITY_STATE_DIR` | Antigravity 任务状态目录 |
+
+`CONTROL_PLANE_*` 和 `TUNNEL_CLIENT_*` 前缀不能用于 MCP 服务的环境变量列表。Tunnel 凭据请在「账号配置」中填写。
+
+</details>
+
+<details>
+<summary><strong>添加自己的 MCP 服务</strong></summary>
+
+在 **「MCP 服务」** 页点击 **「添加 MCP 服务」**，根据服务类型填写：
+
+| 字段 | 用法 |
+| --- | --- |
+| 服务名称 / 标签 | 用于识别服务 |
+| 服务类型 | 本地进程选择 stdio；远程地址按服务选择 HTTP/SSE |
+| 可执行文件 | 程序的完整路径或系统命令，例如 `C:\Program Files\nodejs\node.exe` |
+| Arguments | 逐项添加启动参数 |
+| cwd | 可选，指定工作目录 |
+| HTTP URL / Headers | HTTP/SSE 服务使用 |
+| 环境变量列表 | 该 MCP 进程需要的变量 |
+
+也可以使用 **「发现本机配置」**，查看并导入已有配置的预览。
+
+</details>
+
+<a id="faq"></a>
+
+## 常见问题
+
+| 问题 | 处理方式 |
+| --- | --- |
+| Node.js 版本过低 / 找不到 Python | 按[运行环境](#quick-start)安装或升级，重开终端后重新运行安装脚本 |
+| 安装中途失败，是否需要从头清理？ | 先看 `[FAIL]` 行，修复问题后重跑；已完成的同版本组件会自动跳过 |
+| 隧道提示 MCP 命令不可用 | 重跑对应组件安装脚本；检查修复后的 YAML 或生成的 `*.yaml.suggested` |
+| 控制台端口被占用 | 用 `PORT` 更换端口，或正常停止已确认的旧实例 |
+| 隧道连接失败，是否与代理有关？ | 核对代理是否可用；未配置三个代理变量时，当前默认地址是 `http://127.0.0.1:7897` |
+| 中文用户名或路径包含空格 | 安装器处理了 Windows 参数引号，Antigravity `.pth` 使用 ASCII 相对路径；仍失败时请提交脱敏后的完整错误 |
+| 已安装 Antigravity MCP，却无法使用原生 Agent 协作 | 确认 Antigravity IDE 已安装、已登录并正在运行；REST fallback 不提供该能力 |
+| 忘记管理员密码 | 先完整备份控制台数据与密钥；删除数据目录重新初始化会清空原账号库，需要重新配置 |
+| 怎样备份或迁移？ | 备份上表中的控制台数据、隧道 YAML 和需要保留的业务目录；新电脑独立初始化，并为同时在线的实例分配不同的 Tunnel ID |
+
+控制台只接受本机回环地址。停止隧道请使用页面操作；排查进程时应核对具体实例身份，避免按进程名或端口批量终止其他程序。
+
+<a id="validation"></a>
+
+## 已做过哪些验证
+
+以下为 **2026-11-13 发布基线 [`f129c32`](https://github.com/zwsxzy/mcp-tunnel-account-manager/commit/f129c32e0a46e7c81de744977cd8ebb0e7fca76a)** 的实际验证记录，后续修改 README 不改变这份记录的对应版本。
+
+| 验证范围 | 结果 |
+| --- | --- |
+| 完整默认 unit | **62 / 62 个测试文件通过**，退出码 0，约 201 秒 |
+| 安装脚本验证 | **48 / 48 项通过** |
+| Antigravity MCP 握手 | 成功，返回 **8 个工具** |
+| Overleaf MCP 握手 | 成功，返回 **18 个工具** |
+| 控制台启动 | 使用隔离数据目录和随机本地端口，首页返回 **HTTP 200** 与 HTML |
+| 发布文件 | 测试快照与待发布副本的 **356 个文件**一致，关键文件经 GitHub 回读核验 |
+
+完整 unit 保留原有测试集合与超时限制。握手和页面启动验证的范围不包含真实 Overleaf 项目同步 / 编译，或 Antigravity IDE 的实际业务任务。
+
+### 本地开发与验证
+
+在项目根目录执行：
+
+```powershell
+npm.cmd start          # 前台启动控制台
+npm.cmd run test:unit  # 默认单元测试
 npm.cmd run test:all   # 含集成测试
 npm.cmd run check      # 静态检查
 ```
 
-测试使用临时目录、合成凭据和随机本地端口，不需要真实隧道或账号。
+相关文档：[构建说明](docs/BUILD-RELEASE.md) · [切换修复记录](docs/SAFE-SWITCH-FIX.zh-CN.md) · [部署与验证边界](docs/NEW-BRANCH-DEPLOY.zh-CN.md)。
 
-构建与验证文档：
+<a id="contributing"></a>
 
-- [离线构建说明](docs/BUILD-RELEASE.md)
+## 让这个项目变得更好
+
+如果它帮你少做了一次重复配置，欢迎点亮 **⭐ Star**。
+
+- **遇到问题：** [提交 Issue](https://github.com/zwsxzy/mcp-tunnel-account-manager/issues)，附上 Windows / Node.js / Python 版本、复现步骤和脱敏日志。
+- **有使用建议：** 分享你正在使用的 MCP 组合，以及希望简化的操作。
+- **愿意贡献：** 欢迎通过 Pull Request 改善文档、修复问题或补充可复现的测试。
+
+请在提交截图、日志或配置前移除 API Key、初始化码、Cookie 和其他个人凭据。
+
+<a id="history"></a>
+
+## 历史版本与第三方说明
+
+<details>
+<summary>查阅旧发行包与迁移工具</summary>
+
+`v1.2.0-preview.2` 至 `v1.2.0-preview.5` 的 ZIP 发行包、`deployment/windows/` 迁移工具源码及 `packaging/windows/templates/` 外壳模板属于历史发布物。
+
+旧包包含当时的运行依赖与组件版本，请勿覆盖到当前源码目录。当前 `final` 分支以本文的安装方式及 Node.js **22.14.0+** 要求为准。
+
+- [v1.2.0-preview.5 发布说明](docs/releases/v1.2.0-preview.5/RELEASE_NOTES.zh-CN.md)
+- [v1.2.0-preview.5 中文部署说明](docs/releases/v1.2.0-preview.5/README-Release.zh-CN.md)
 - [v1.2.0-preview.5 隔离验证报告](docs/releases/v1.2.0-preview.5/VALIDATION.zh-CN.md)
 
----
+</details>
 
-## 11. 安全边界
+感谢 [openai/tunnel-client](https://github.com/openai/tunnel-client)、[yangzichao/mcp-server-overleaf](https://github.com/yangzichao/mcp-server-overleaf) 与 [zwsxzy/antigravity-mcp-fork](https://github.com/zwsxzy/antigravity-mcp-fork) 提供组件能力。
 
-- 控制台只监听 `127.0.0.1`，不对外网暴露。
-- 仓库与发布内容**不包含**任何真实账号、密钥、Cookie、隧道 ID、初始化码或浏览器/IDE profile。
-- 每台电脑独立初始化；每台同时在线的电脑、每个服务应使用**独立 Tunnel ID**。
-- 不要把使用后生成的 `%LOCALAPPDATA%\McpTunnelAccountManager`、`%APPDATA%\tunnel-client\*.yaml`、日志或 `master.key` 提交到 Git。
-- 停止隧道时按执行文件、入口与创建时间核对身份，不按端口或进程名批量终止。
+项目当前尚未指定整体许可证。第三方组件各自的许可证、NOTICE、SPDX 与来源信息保留在相应源码、发行包或安装目录中。
 
----
-
-## 12. 许可
-
-项目自身许可证尚未指定，本次不代作者选择 MIT/Apache 或授予额外权利。第三方许可证、NOTICE、SPDX 及来源信息保留在相应发行包与安装目录中；公开分发仍应由维护者确认授权。
