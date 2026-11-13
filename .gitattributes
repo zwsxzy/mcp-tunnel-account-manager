@@ -13,3 +13,6 @@
 /docs/BUILD-RELEASE.md text eol=lf
 /.gitignore text eol=lf
 /.gitattributes text eol=lf
+# Analysis notes are prose, not release inputs: keep them LF like the other docs so an
+# editor's EOL setting cannot turn a small edit into a whole-file diff.
+/docs/analysis/*.md text eol=lf

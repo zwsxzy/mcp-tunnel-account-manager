@@ -446,8 +446,14 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
     let carrierFixtureDir;
     let wakeCount = 0;
     let createdAction = null;
+    // Mirrors the shape the real store returns (see store.mjs getServiceRuntime):
+    // `runtimeState` + `activeProfileId` + `instances`, NOT a top-level `state`.
+    // The old fixture used `state`/`tunnelClient`-only rows, which is why it kept
+    // passing against code paths the production reader never reaches.
     let mockRuntime = {
-      state: 'stopped',
+      runtimeState: 'stopped',
+      activeProfileId: null,
+      instances: [],
       tunnelClient: {
         state: 'stopped',
         managed: true,
@@ -459,6 +465,10 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
     before(async () => {
       const fakeRepo = {
         getRevision: async () => 1,
+        // The real store exposes getServiceRuntime at the STORE level; attachRegistry
+        // does not export one. The fixture used to hang it off `registry`, which no
+        // production caller can reach.
+        getServiceRuntime: (id) => mockRuntime,
         registry: {
           getMcp: (id) => {
             if (id === 'carrier-mcp') {
@@ -551,7 +561,9 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
 
     test('POST /api/mcps/:id/start without profileId returns 400 PROFILE_REQUIRED', async () => {
       mockRuntime = {
-        state: 'stopped',
+        runtimeState: 'stopped',
+        activeProfileId: null,
+        instances: [],
         tunnelClient: { state: 'stopped', absenceVerified: true, observedAt: Date.now() }
       };
       const res = await fetch(`${ctx.baseUrl}/api/mcps/stdio-mcp/start`, {
@@ -568,13 +580,18 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
     });
 
     test('POST /api/mcps/:id/start returns 200 ALREADY_RUNNING fast no-op if already running', async () => {
+      // `pid` must be a LIVE process: the no-op is only honest when the recorded
+      // pid exists, otherwise a stale cache row would answer "已在运行" for a dead
+      // tunnel and the retry could never succeed.
       mockRuntime = {
-        state: 'running',
+        runtimeState: 'running',
+        activeProfileId: 'prof-curr',
+        instances: [],
         tunnelClient: {
           state: 'running',
           managed: true,
           identityVerified: true,
-          pid: 9988,
+          pid: process.pid,
           profileId: 'prof-curr',
           startedAt: '2026-11-06T00:00:00.000Z',
           executablePath: 'C:\\bin\\tunnel-client.exe',
@@ -592,12 +609,54 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
       assert.equal(res.status, 200);
       const data = await res.json();
       assert.equal(data.code, 'ALREADY_RUNNING');
-      assert.equal(data.pid, 9988);
+      assert.equal(data.pid, process.pid);
     });
 
-    test('POST /api/mcps/:id/stop returns 200 ALREADY_STOPPED fast no-op if already stopped', async () => {
+    test('POST /api/mcps/:id/start does NOT no-op on a dead pid in the cache', async () => {
+      // Regression: the service-level fast path trusted `state === 'running'` from
+      // the observer cache. The cache outlives the process (externally killed client,
+      // console crash, "close all tunnel-client"), so the console showed the service
+      // as stopped while this route answered "已在运行 (PID: …)" and started nothing.
       mockRuntime = {
-        state: 'stopped',
+        runtimeState: 'running',
+        activeProfileId: 'prof-curr',
+        instances: [],
+        tunnelClient: {
+          state: 'running',
+          managed: true,
+          identityVerified: true,
+          pid: 999999,
+          profileId: 'prof-curr',
+          startedAt: '2026-11-06T00:00:00.000Z',
+          executablePath: 'C:\\bin\\tunnel-client.exe',
+          observedAt: Date.now()
+        }
+      };
+      const res = await fetch(`${ctx.baseUrl}/api/mcps/stdio-mcp/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'Idempotency-Key': 'idem-start-stale-cache'
+        },
+        body: JSON.stringify({ expectedRevision: 1, profileId: 'prof-curr' })
+      });
+      const data = await res.json();
+      assert.notEqual(data.code, 'ALREADY_RUNNING', 'a dead pid must not be reported as already running');
+      // This (correctly) enqueued a real action; `createdAction` is shared with the
+      // later guard tests, which assert it stays null. Clear the spy so the proof
+      // here does not leak into them.
+      createdAction = null;
+    });
+
+    test('POST /api/mcps/:id/stop does NOT trust a cached stopped row (no false success)', async () => {
+      // Regression for the removed fast path. A cached `stopped + absenceVerified`
+      // is a PAST observation: a tunnel restarted elsewhere, a recycled pid, or a
+      // stale row from a crashed console would all be answered with 200
+      // ALREADY_STOPPED without anything being inspected or stopped.
+      mockRuntime = {
+        runtimeState: 'stopped',
+        activeProfileId: null,
+        instances: [],
         tunnelClient: {
           state: 'stopped',
           managed: true,
@@ -605,6 +664,7 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
           observedAt: Date.now()
         }
       };
+      createdAction = null;
       const res = await fetch(`${ctx.baseUrl}/api/mcps/stdio-mcp/stop`, {
         method: 'POST',
         headers: {
@@ -613,14 +673,22 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
         },
         body: JSON.stringify({ expectedRevision: 1 })
       });
-      assert.equal(res.status, 200);
+      // Stop now always goes through the lifecycle so the runner can take a fresh
+      // authoritative inspection under its lock. Any genuine noop is decided THERE.
+      assert.equal(res.status, 202);
       const data = await res.json();
-      assert.equal(data.code, 'ALREADY_STOPPED');
+      assert.notEqual(data.code, 'ALREADY_STOPPED', 'the cache must not answer a stop');
+      assert.ok(createdAction, 'a stop lifecycle action must be queued');
+      assert.equal(createdAction.action, 'stop');
+      assert.equal(createdAction.serviceId, 'stdio-mcp');
+      createdAction = null;
     });
 
     test('POST /api/mcps/:id/stop on controlCarrier without token returns 409 CARRIER_CONFIRMATION_REQUIRED with signed carrierToken', async () => {
       mockRuntime = {
-        state: 'running',
+        runtimeState: 'running',
+        activeProfileId: 'carrier-prof',
+        instances: [],
         tunnelClient: {
           state: 'running',
           managed: true,
@@ -674,7 +742,9 @@ describe('Tunnel Client Lifecycle Management Suite', () => {
 
     test('POST /api/mcps/:id/start queues action with 202 and wakes runner', async () => {
       mockRuntime = {
-        state: 'stopped',
+        runtimeState: 'stopped',
+        activeProfileId: null,
+        instances: [],
         tunnelClient: {
           state: 'stopped',
           managed: true,

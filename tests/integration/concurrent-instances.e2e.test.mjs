@@ -528,4 +528,82 @@ describe('Concurrent multi-account tunnel instances (e2e)', () => {
       { decision: 'reject', code: 'EXTERNAL_CLIENT_NOT_MANAGED' }
     );
   });
+
+  // -------------------------------------------------------------------------
+  // 5. Instance actions must NEVER move the legacy single-active pointer
+  // -------------------------------------------------------------------------
+  test('5. instance start/stop leave active_profiles untouched while the legacy pointer still advances', async () => {
+    // Seed the legacy pointer with a DIFFERENT owner. This is the condition that
+    // exposes the bug: with an empty pointer (null -> null) a broken
+    // finishLifecycleAction looks harmless, which is exactly how it shipped green.
+    const pointerOwner = PROFILE_B;
+    store.registry.handleSetActiveService(SERVICE_ID, pointerOwner, 1, 1);
+
+    const readPointer = () => store.getServiceRuntime(SERVICE_ID).activeProfileId;
+    const readState = () => store.getServiceRuntime(SERVICE_ID).runtimeState;
+
+    assert.equal(readPointer(), pointerOwner, 'seed failed: legacy pointer must be pre-set');
+
+    // Start BOTH instances for the same service. Neither may touch the pointer.
+    const startA = await runAction('start', PROFILE_A);
+    assert.equal(startA.loaded.state, 'SUCCEEDED');
+    assert.equal(readPointer(), pointerOwner, 'instance start A must not move the legacy pointer');
+
+    const startB = await runAction('start', PROFILE_B);
+    assert.equal(startB.loaded.state, 'SUCCEEDED');
+    assert.equal(readPointer(), pointerOwner, 'instance start B must not move the legacy pointer');
+
+    // Both instances really are running...
+    assert.equal(store.getInstanceRuntime(INSTANCE_A).state, 'running');
+    assert.equal(store.getInstanceRuntime(INSTANCE_B).state, 'running');
+    assert.equal(readState(), 'running', 'a service with a live instance must read as running');
+
+    // ...and stopping one must not clear the pointer either (this was the worst
+    // symptom: the console reported the service as stopped while a tunnel lived).
+    const stopA = await runAction('stop', PROFILE_A);
+    assert.equal(stopA.loaded.state, 'SUCCEEDED');
+    assert.equal(readPointer(), pointerOwner, 'instance stop A must not clear the legacy pointer');
+    assert.equal(readState(), 'running', 'sibling B still running => service still running');
+
+    // A legacy WHOLE-SERVICE action must still advance/clear the pointer exactly
+    // as before: instance scoping must not disable the legacy hot-switch model.
+    const legacyStart = await store.registry.createLifecycleAction({
+      action: 'start',
+      serviceId: SERVICE_ID,
+      profileId: PROFILE_A
+    });
+    await store.registry.finishLifecycleAction(
+      legacyStart.id,
+      { started: true, operationId: legacyStart.id, service: SERVICE_ID },
+      { action: 'start', profileId: PROFILE_A }
+    );
+    assert.equal(readPointer(), PROFILE_A, 'legacy whole-service start must still set the pointer');
+
+    const legacyStop = await store.registry.createLifecycleAction({
+      action: 'stop',
+      serviceId: SERVICE_ID,
+      profileId: PROFILE_A
+    });
+    await store.registry.finishLifecycleAction(
+      legacyStop.id,
+      { stopped: true, operationId: legacyStop.id, service: SERVICE_ID, proof: { kind: 'verified-already-stopped' } },
+      { action: 'stop' }
+    );
+    assert.equal(readPointer(), null, 'legacy whole-service stop must still clear the pointer');
+
+    // The legacy instance-less wrapper keeps its original behaviour too.
+    store.registry.handleSetActiveService(SERVICE_ID, pointerOwner, 1, 1);
+    const legacyStop2 = await store.registry.createLifecycleAction({
+      action: 'stop',
+      serviceId: SERVICE_ID,
+      profileId: PROFILE_A
+    });
+    await store.registry.finishStoppedAction(legacyStop2.id, {
+      stopped: true, operationId: legacyStop2.id, service: SERVICE_ID, proof: { kind: 'verified-already-stopped' }
+    });
+    assert.equal(readPointer(), null, 'finishStoppedAction must still clear the pointer');
+
+    // Clean up so later assertions/state stay predictable.
+    await runAction('stop', PROFILE_B);
+  });
 });

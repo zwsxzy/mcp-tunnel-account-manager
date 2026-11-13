@@ -19,6 +19,8 @@ import {
   HttpTransportFault
 } from './http-transport.mjs';
 import { buildTunnelLaunchEnvironment, TunnelLaunchEnvironmentFault } from './tunnel-launch-environment.mjs';
+import { createPsWorkerPool, createHelperBudget, PsWorkerFault, PS_FAULT_CODES } from './ps-worker-pool.mjs';
+import { DEFAULT_CRITICAL_SERVICE_IDS } from '../core/resource-policy.mjs';
 import {
   getHttpTransportPacketPath,
   persistHttpTransportPacket,
@@ -55,12 +57,25 @@ export const SAFE_INHERITED_KEYS = [
  * Constructs a safe pinned child process environment.
  * Pins only allowlisted system variables from parent process.env, preventing
  * arbitrary host secrets from leaking to child processes.
+ *
+ * `codexBridgeEnabled` 为 false 时，从继承的 PATH 中移除 npm 目录，使
+ * tunnel-client 探测不到 codex、不再拉起约 96 MB 的 `codex app-server` 桥接
+ * 及其控制台窗口。该开关由控制台设置持久化，默认 true 以保持历史行为。
  */
-export function buildSafePinnedEnv(explicit = {}) {
+export function buildSafePinnedEnv(explicit = {}, { codexBridgeEnabled } = {}) {
   const pinned = {};
   for (const key of SAFE_INHERITED_KEYS) {
     if (process.env[key] !== undefined) {
       pinned[key] = process.env[key];
+    }
+  }
+  if (codexBridgeEnabled === false) {
+    for (const key of Object.keys(pinned)) {
+      if (key.toUpperCase() !== 'PATH') continue;
+      pinned[key] = pinned[key]
+        .split(path.delimiter)
+        .filter(segment => segment && !/[\\/]Roaming[\\/]npm(?:[\\/]|$)/i.test(segment))
+        .join(path.delimiter);
     }
   }
   return {
@@ -117,7 +132,13 @@ function updateYamlControlPlane(rawYaml, { tunnelId, organizationId, apiKey = 'e
     lines.push('  commands:');
     if (service === 'overleaf-mcp') {
       lines.push('    - channel: main');
-      lines.push(`      command: "node ${userProfilePath('.overleaf-mcp', 'runtime', 'node_modules', 'mcp-server-overleaf', 'dist', 'index.js').replaceAll('\\\\', '/')} --stdio"`);
+      // Emit a properly-escaped YAML scalar. The previous double-quoted
+      // interpolation left raw Windows backslashes inside a YAML double-quoted
+      // string, so `C:\\Users\\...` produced `\U`/`\o`/`\r` escapes and the
+      // tunnel-client rejected the config ("did not find expected hexdecimal
+      // number"). JSON.stringify yields a valid YAML double-quoted scalar with
+      // every backslash escaped, matching the binding branches below.
+      lines.push(`      command: ${JSON.stringify(`node ${userProfilePath('.overleaf-mcp', 'runtime', 'node_modules', 'mcp-server-overleaf', 'dist', 'index.js')} --stdio`)}`);
     } else if (service === 'antigravity-mcp') {
       lines.push('    - channel: main');
       lines.push('      command: "antigravity-mcp"');
@@ -321,14 +342,10 @@ function parseYamlControlPlane(rawYaml) {
  * Controller wrapper for fixed helper actions: Inspect, Verify, Stop, Launch.
  * Supports safe intent/tag recovery and runtimeCommand test hook for raw JSON fakes.
  */
-let sharedPsWorker = null;
-let sharedPsReqCounter = 0;
+let sharedPsWorkerPool = null;
+let sharedHelperBudget = null;
 
-function getOrStartPsWorker() {
-  if (sharedPsWorker && !sharedPsWorker.dead) {
-    return sharedPsWorker;
-  }
-
+function spawnPowershellWorker() {
   const workerScript = [
     'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force',
     '$ErrorActionPreference = "Continue"',
@@ -379,109 +396,49 @@ function getOrStartPsWorker() {
   if (typeof child.stdin?.unref === 'function') child.stdin.unref();
   if (typeof child.stdout?.unref === 'function') child.stdout.unref();
   if (typeof child.stderr?.unref === 'function') child.stderr.unref();
+  return child;
 
-  const pending = new Map();
-  let keepAliveTimer = null;
-  let buffer = '';
-
-  function updateRef() {
-    if (pending.size > 0 && !keepAliveTimer) {
-      keepAliveTimer = setInterval(() => {}, 30000);
-    } else if (pending.size === 0 && keepAliveTimer) {
-      clearInterval(keepAliveTimer);
-      keepAliveTimer = null;
-    }
-  }
-
-  const state = {
-    child,
-    dead: false,
-    send(scriptPath, splatParams) {
-      return new Promise((resolve, reject) => {
-        if (state.dead) {
-          return reject(new Error('PS worker closed'));
-        }
-        const id = `req_${++sharedPsReqCounter}`;
-        const timer = setTimeout(() => {
-          if (pending.has(id)) {
-            pending.delete(id);
-            updateRef();
-            reject(new Error('PS worker timeout'));
-          }
-        }, 12000);
-        if (typeof timer.unref === 'function') timer.unref();
-
-        pending.set(id, { resolve, reject, timer });
-        updateRef();
-
-        try {
-          const line = JSON.stringify({ id, scriptPath, params: splatParams }) + '\n';
-          child.stdin.write(line, 'utf8');
-        } catch (err) {
-          clearTimeout(timer);
-          pending.delete(id);
-          updateRef();
-          reject(err);
-        }
-      });
-    }
-  };
-
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk;
-    let nl;
-    while ((nl = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      const markerIdx = line.indexOf('__MCP_PS_RESP__');
-      if (markerIdx !== -1) {
-        const jsonPart = line.slice(markerIdx + '__MCP_PS_RESP__'.length);
-        try {
-          const msg = JSON.parse(jsonPart);
-          const entry = pending.get(msg.id);
-          if (entry) {
-            clearTimeout(entry.timer);
-            pending.delete(msg.id);
-            updateRef();
-            let parsed = null;
-            try {
-              if (msg.stdout && msg.stdout.trim()) {
-                parsed = JSON.parse(msg.stdout.trim());
-              }
-            } catch (_) {}
-            entry.resolve({
-              code: msg.code ?? 0,
-              stdout: msg.stdout || '',
-              stderr: msg.stderr || '',
-              data: parsed,
-              ...(parsed || {})
-            });
-          }
-        } catch (_) {}
-      }
-    }
-  });
-
-  const markDead = (err) => {
-    state.dead = true;
-    for (const [id, entry] of pending.entries()) {
-      clearTimeout(entry.timer);
-      entry.reject(err || new Error('PS worker exited'));
-    }
-    pending.clear();
-    updateRef();
-  };
-
-  child.on('error', markDead);
-  child.on('close', () => markDead(new Error('PS worker closed')));
-
-  sharedPsWorker = state;
-  return state;
 }
 
-export function createDefaultProcessController({ dataDir, scriptPath, runtimeCommand, paths }) {
+/**
+ * The shared worker is a module-level singleton: every adapter and every
+ * instance provider inside one manager process must serialize on the SAME pipe.
+ * Tests may inject their own pool; nothing is spawned until the first send.
+ */
+export function getSharedPsWorkerPool(limits = {}) {
+  if (!sharedPsWorkerPool) {
+    sharedPsWorkerPool = createPsWorkerPool({ spawnWorker: spawnPowershellWorker, ...limits });
+  }
+  return sharedPsWorkerPool;
+}
+
+export function getSharedHelperBudget(limits = {}) {
+  if (!sharedHelperBudget) sharedHelperBudget = createHelperBudget(limits);
+  return sharedHelperBudget;
+}
+
+export function createDefaultProcessController({
+  dataDir,
+  scriptPath,
+  runtimeCommand,
+  paths,
+  criticalServiceIds = DEFAULT_CRITICAL_SERVICE_IDS,
+  psWorkerPool = null,
+  psWorkerLimits = {},
+  helperBudget = null,
+  helperBudgetOptions = {},
+  helperExecutionTimeoutMs = 12000,
+  // After a kill request, how long the PUBLIC call waits for the OS to report the
+  // exit before it returns an explicit `exitUnconfirmed` error. The PHYSICAL
+  // budget lease is NOT released here: a kill request is not an exit, so the slot
+  // stays with the child until it really closes (or is provably never created).
+  helperKillGraceMs = 5000,
+  spawnHelper = spawn,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout
+} = {}) {
   const runtimeDir = path.join(dataDir, 'runtime');
+  const criticalIds = new Set((Array.isArray(criticalServiceIds) ? criticalServiceIds : []).map(String));
 
   function getProcessFile(service) {
     return path.join(runtimeDir, `${service}-process.json`);
@@ -491,14 +448,26 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
     return path.join(runtimeDir, `${service}-intent.json`);
   }
 
-  if (typeof runtimeCommand !== 'function' && scriptPath && fs.existsSync(scriptPath) && !process.env.NODE_TEST_CONTEXT) {
-    try {
-      const w = getOrStartPsWorker();
-      w.send(scriptPath, { Action: 'Inspect', ProcessId: 0 }).catch(() => {});
-    } catch (_) {}
+  // No constructor prewarm: the shared worker and the standalone helper budget
+  // are created lazily on the first real request. A manager start must not pay
+  // for (or leave behind) a PowerShell process that was never used, and
+  // createAdapters() must not append an Inspect per service or per instance.
+  function isCriticalService(service) {
+    return criticalIds.has(String(service));
   }
 
-  async function executeHelper(action, params = {}) {
+  /**
+   * A control-channel fault is never evidence of absence. Standalone-helper failures
+   * are tagged `controlChannel` at the narrow helper-call boundary (see
+   * executeHelper), so inspect() can propagate them without a broad code rule:
+   * a plain ENOENT/parse failure of a runtime file keeps its existing semantics.
+   */
+  function isControlChannelFault(error) {
+    return error instanceof SwitchFault
+      || (error !== null && typeof error === 'object' && error.controlChannel === true);
+  }
+
+  async function executeHelper(action, params = {}, { critical = false } = {}) {
     if (typeof runtimeCommand === 'function') {
       const res = await runtimeCommand(action, params);
       if (typeof res === 'string') {
@@ -535,9 +504,10 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
     if (params.Port) splatParams.Port = Number(params.Port);
     if (params.LaunchPayload) splatParams.LaunchPayload = params.LaunchPayload;
 
+    const role = critical === true || action === 'Stop' || isCriticalService(params.service);
     try {
-      const worker = getOrStartPsWorker();
-      return await worker.send(scriptPath, splatParams);
+      const pool = psWorkerPool || getSharedPsWorkerPool(psWorkerLimits);
+      return await pool.send(scriptPath, splatParams, { critical: role });
     } catch (error) {
       // A Launch may have succeeded before an acknowledgement was lost. Never
       // replay it (or silently fall back to Node's console-less spawn): that can
@@ -545,9 +515,78 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
       if (action === 'Launch') {
         throw new SwitchFault('PROCESS_LAUNCH_UNCONFIRMED', 'Native launch acknowledgement was not confirmed');
       }
-      // Read-only/idempotent helper actions may use standalone PowerShell.
+      /**
+       * The standalone helper is a BOUNDED emergency lane (peak 2, 1 normal), not
+       * a second queue. It may only be used when the shared worker never became
+       * usable at all, so the request provably never touched a PowerShell pipe:
+       *   - UNAVAILABLE / SPAWN_FAILED: the worker could not start;
+       *   - WRITE_FAILED: the line never reached the pipe.
+       * Congestion must NOT be converted into extra processes: QUEUE_FULL and
+       * QUEUE_TIMEOUT mean the single worker is busy, and spawning a helper per
+       * congested call is exactly the fallback storm this budget exists to stop.
+       * EXECUTION_TIMEOUT / CLOSED likewise never fall back (the request may still
+       * be running, or the pool was deliberately shut down).
+       */
+      const workerUnusable = error instanceof PsWorkerFault && error.dispatched === false
+        && (error.code === PS_FAULT_CODES.UNAVAILABLE
+          || error.code === PS_FAULT_CODES.SPAWN_FAILED
+          || error.code === PS_FAULT_CODES.WRITE_FAILED);
+      if (!workerUnusable) {
+        const code = error instanceof PsWorkerFault
+          ? (error.code === PS_FAULT_CODES.EXECUTION_TIMEOUT ? 'PROCESS_CONTROL_TIMEOUT'
+            : (error.code === PS_FAULT_CODES.QUEUE_FULL || error.code === PS_FAULT_CODES.QUEUE_TIMEOUT)
+              ? 'PROCESS_CONTROL_CONGESTED'
+              : 'PROCESS_CONTROL_UNAVAILABLE')
+          : 'PROCESS_CONTROL_UNAVAILABLE';
+        const fault = new SwitchFault(code, error?.message || 'Native helper unavailable');
+        fault.helperCode = error?.code ?? null;
+        throw fault;
+      }
+      // Provably never dispatched and the worker is unusable: a bounded standalone
+      // PowerShell helper is allowed for read-only/idempotent actions only.
     }
 
+    const budget = helperBudget || getSharedHelperBudget(helperBudgetOptions);
+    let releaseBudget = null;
+    try {
+      releaseBudget = await budget.acquire({ critical: role });
+    } catch (error) {
+      const fault = new SwitchFault('PROCESS_CONTROL_CONGESTED',
+        error?.message || 'Standalone helper budget is exhausted');
+      fault.helperCode = error?.code ?? null;
+      throw fault;
+    }
+    // The public call and the physical lease are deliberately separate: the caller
+    // may give up at executionTimeoutMs + helperKillGraceMs (an explicit
+    // `exitUnconfirmed` error), but the budget slot belongs to the real child.
+    // Returning it on the public timeout let the next request spawn a second
+    // helper while the first was still alive (peak > 2). It is returned only when
+    // the child is provably gone ('close'), or when spawn failed before any
+    // process existed.
+    let leaseReleased = false;
+    const releaseLease = () => {
+      if (leaseReleased) return;
+      leaseReleased = true;
+      try { releaseBudget(); } catch (_) {}
+    };
+    try {
+      return await runStandaloneHelper(action, params, { onPhysicalSettle: releaseLease });
+    } catch (error) {
+      // NARROW BOUNDARY: every failure returned by the standalone-helper lane is a
+      // CONTROL-CHANNEL failure (the helper IS the control channel). Tag it here so
+      // inspect() can propagate it without a broad `code.startsWith(...)` rule and
+      // without changing the error's own code/message - direct verify() keeps the
+      // existing PS_HELPER_TIMEOUT semantics. Ordinary file read/parse failures
+      // inside inspect() are untouched.
+      if (error && typeof error === 'object') {
+        try { error.controlChannel = true; } catch (_) {}
+      }
+      throw error;
+    }
+  }
+
+  function runStandaloneHelper(action, params, { onPhysicalSettle = () => {} } = {}) {
+    const releaseLease = typeof onPhysicalSettle === 'function' ? onPhysicalSettle : () => {};
     return new Promise((resolve, reject) => {
       const args = [
         '-NoProfile',
@@ -582,30 +621,166 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
         args.push('-Tag', String(params.Tag));
       }
       if (params.CommandLine) {
-        args.push('-CommandLine', String(params.CommandLine));
+        args.push('-CommandLine', params.CommandLine);
       }
       if (params.Port) {
         args.push('-Port', String(params.Port));
       }
 
-      const child = spawn('powershell', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
-      });
+      let child;
+      try {
+        child = spawnHelper('powershell', args, {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true
+        });
+      } catch (error) {
+        // spawn() threw synchronously: no helper process exists, so the physical
+        // lease can be returned immediately (nothing was created).
+        releaseLease();
+        reject(error);
+        return;
+      }
+
       let stdout = '';
       let stderr = '';
-      child.stdout.on('data', d => { stdout += d; });
-      child.stderr.on('data', d => { stderr += d; });
-      child.on('close', code => {
+      let settled = false;
+      let timedOut = false;
+      let spawnConfirmed = false;
+      let deadline = null;
+      let graceTimer = null;
+      const missingPipes = [];
+      const timeoutFault = () => Object.assign(new Error('Standalone PS helper timed out'),
+        { code: 'PS_HELPER_TIMEOUT', dispatched: true });
+      // A helper whose output pipe never existed cannot produce a trustworthy
+      // result. This is a control-channel fault (SwitchFault), never a timeout and
+      // never a success, so inspect() cannot publish it as a verified absence.
+      const outputUnavailableFault = exitCode => {
+        const fault = new SwitchFault('PROCESS_CONTROL_UNCONFIRMED');
+        fault.helperCode = 'PS_HELPER_OUTPUT_UNAVAILABLE';
+        fault.dispatched = true;
+        fault.missingPipes = [...missingPipes];
+        fault.exitCode = exitCode;
+        return fault;
+      };
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (deadline) clearTimeoutFn(deadline);
+        if (graceTimer) clearTimeoutFn(graceTimer);
+        fn(value);
+      };
+      const onClose = code => {
+        // The process is provably gone now: only this returns the physical slot.
+        releaseLease();
+        if (timedOut) {
+          finish(reject, timeoutFault());
+          return;
+        }
+        if (missingPipes.length > 0) {
+          // The helper ran but its output pipes never existed, so no result can be
+          // trusted: report a distinct failure instead of fabricating a success.
+          // A SwitchFault keeps inspect() from publishing this control-channel
+          // fault as a verified absence.
+          finish(reject, outputUnavailableFault(code));
+          return;
+        }
         let parsed = null;
         try {
           if (stdout.trim()) {
             parsed = JSON.parse(stdout.trim());
           }
         } catch (_) {}
-        resolve({ code, stdout, stderr, data: parsed, ...(parsed || {}) });
-      });
-      child.on('error', err => reject(err));
+        finish(resolve, { code, stdout, stderr, data: parsed, ...(parsed || {}) });
+      };
+      const onError = err => {
+        // Only a spawn that never confirmed a process (no pid, no 'spawn' event)
+        // proves there is nothing left to hold the slot for. An error on a live
+        // child must NOT return the lease. A pid getter that throws is treated as
+        // "cannot prove absence" and keeps the lease.
+        let pid = null;
+        let pidReadable = false;
+        try { pid = child.pid; pidReadable = true; } catch (_) { pidReadable = false; }
+        if (!spawnConfirmed && pidReadable && !pid) releaseLease();
+        if (!timedOut) finish(reject, err);
+      };
+      // OBSERVE FIRST, JUDGE THE PIPES SECOND. A child object without stdout/stderr
+      // is NOT proof that no process was created - a pid proves the opposite - so
+      // the exit observation is attached before anything is concluded. Reading the
+      // `on` property is INSIDE the try: it may be a getter that throws, and that
+      // must become a control fault (isolated lease), not a bare TypeError that
+      // inspect() would swallow into a verified absence.
+      const readChildField = (name, fallback) => {
+        try { return child && child[name] !== undefined ? child[name] : fallback; } catch (_) { return fallback; }
+      };
+      let exitObserved = false;
+      let hasEventInterface = false;
+      if (child) {
+        try {
+          hasEventInterface = typeof child.on === 'function';
+          if (hasEventInterface) {
+            child.on('spawn', () => { spawnConfirmed = true; });
+            child.on('close', onClose);
+            child.on('error', onError);
+            exitObserved = true;
+          }
+        } catch (_) {
+          // A listener registered before the throw may still fire; if 'close' is one
+          // of them the lease is returned there (releaseLease is idempotent).
+          exitObserved = false;
+        }
+      }
+      if (!exitObserved) {
+        // Null/malformed child object, or listener registration that failed: the exit
+        // can never be observed AND non-creation is not proven. The physical lease is
+        // therefore ISOLATED (kept, never returned) and the public call fails at once,
+        // instead of admitting a second helper underneath a possibly live process.
+        // A SwitchFault (not a bare Error) keeps inspect() from downgrading this to
+        // a verified absence.
+        const pid = readChildField('pid', null);
+        const fault = new SwitchFault('PROCESS_CONTROL_UNCONFIRMED');
+        fault.helperCode = 'PS_HELPER_UNOBSERVABLE';
+        fault.dispatched = Boolean(pid);
+        fault.pid = pid;
+        fault.hasPid = Boolean(pid);
+        fault.hasEventInterface = hasEventInterface;
+        finish(reject, fault);
+        return;
+      }
+      // The helper is OUR child (never a tunnel-client). On timeout we only
+      // REQUEST termination: `kill()` does not mean the OS process is gone, and
+      // the budget slot must stay taken until 'close' proves it, otherwise a
+      // replacement helper is admitted while a real one is still alive (peak > 2).
+      // helperKillGraceMs bounds only the PUBLIC wait: past it the caller gets an
+      // explicit `exitUnconfirmed` error, while the physical lease stays with the
+      // still-running child until it really closes. It is never force-released.
+      deadline = setTimeoutFn(() => {
+        timedOut = true;
+        try { child.kill(); } catch (_) {}
+        graceTimer = setTimeoutFn(() => {
+          graceTimer = null;
+          if (missingPipes.length > 0) {
+            // A live helper we could not read: fail with the distinguishable control
+            // fault (still bounded, still exitUnconfirmed, lease still held).
+            finish(reject, Object.assign(outputUnavailableFault(null), { exitUnconfirmed: true }));
+            return;
+          }
+          finish(reject, Object.assign(timeoutFault(), { exitUnconfirmed: true }));
+        }, helperKillGraceMs);
+        if (typeof graceTimer.unref === 'function') graceTimer.unref();
+      }, helperExecutionTimeoutMs);
+      if (typeof deadline.unref === 'function') deadline.unref();
+      if (child.stdout && typeof child.stdout.on === 'function') {
+        child.stdout.on('data', d => { stdout += d; });
+      } else {
+        // Recorded, not released: a pid-bearing child without its pipe is still a
+        // live process, and the public call still fails within the bounded deadline.
+        missingPipes.push('stdout');
+      }
+      if (child.stderr && typeof child.stderr.on === 'function') {
+        child.stderr.on('data', d => { stderr += d; });
+      } else {
+        missingPipes.push('stderr');
+      }
     });
   }
 
@@ -648,7 +823,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
 
       if (stored?.pid) {
         try {
-          const res = await executeHelper('Inspect', { ProcessId: stored.pid });
+          const res = await executeHelper('Inspect', { ProcessId: stored.pid, service });
           const parsed = res.data || res;
 
           if (parsed?.running) {
@@ -668,7 +843,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
             };
           }
         } catch (err) {
-          if (err instanceof SwitchFault) throw err;
+          if (isControlChannelFault(err)) throw err;
         }
       }
 
@@ -700,7 +875,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
           } else if (expectedConfig) {
             findParams.Tag = expectedConfig;
           }
-          const findRes = await executeHelper('FindOwned', findParams);
+          const findRes = await executeHelper('FindOwned', { ...findParams, service });
           const parsed = findRes.data || findRes;
           if (parsed?.running && parsed.pid > 0) {
             return {
@@ -718,7 +893,14 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
               service
             };
           }
-        } catch (_) {}
+        } catch (err) {
+          // A CONTROL-CHANNEL fault is not absence. Swallowing it published
+          // `running: false, absenceVerified: true`, i.e. a congested or dead
+          // helper turned into a positive "no process exists" proof -- exactly the
+          // evidence a stop or a removal consumes. Propagate so the caller keeps
+          // STATE_UNVERIFIED instead.
+          if (isControlChannelFault(err)) throw err;
+        }
       }
 
       return {
@@ -743,6 +925,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
       }
 
       const res = await executeHelper('Verify', {
+        service: identity.service,
         ProcessId: identity.pid,
         ExpectedExecutablePath: expectedExe,
         ExpectedStartTime: expectedStart,
@@ -775,6 +958,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
       }
 
       const res = await executeHelper('Stop', {
+        service: identity.service,
         ProcessId: identity.pid,
         ExpectedExecutablePath: executablePath,
         ExpectedStartTime: startTime,
@@ -906,7 +1090,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
         // Only the fixed native helper can create a hidden console that stdio
         // backend descendants inherit. windowsHide + detached/NO_WINDOW hides
         // the parent only and lets Go/Python/Node children open new terminals.
-        const result = await executeHelper('Launch', { LaunchPayload: payload });
+        const result = await executeHelper('Launch', { LaunchPayload: payload, service });
         const launched = result.data || result;
         if (result.code !== 0 || launched.success !== true ||
             !Number.isSafeInteger(launched.processId) || launched.processId <= 0 ||
@@ -978,7 +1162,7 @@ export function createDefaultProcessController({ dataDir, scriptPath, runtimeCom
         const inspectDeadline = Date.now() + 10000;
         while (Date.now() < inspectDeadline) {
           try {
-            const inspected = await executeHelper('Inspect', { ProcessId: child.pid });
+            const inspected = await executeHelper('Inspect', { ProcessId: child.pid, service });
             const p = inspected.data || inspected;
             if (p?.running) {
               verifiedExe = p.executablePath || verifiedExe;
@@ -1032,6 +1216,11 @@ class ServiceAdapter {
     this.paths = paths;
     this.healthURL = healthURL || null;
 
+    // Codex 桥接开关：支持动态读取函数或静态配置，未配置视为开启。
+    // false 时启动隧道会剔除 PATH 中的 npm 目录，避免拉起 codex app-server。
+    this._codexBridgeEnabled = paths?.codexBridgeEnabled;
+    this._getCodexBridgeEnabled = paths?.getCodexBridgeEnabled;
+
     this.configPath = service === 'overleaf-mcp'
       ? paths.overleafConfigPath
       : service === 'antigravity-mcp'
@@ -1045,6 +1234,17 @@ class ServiceAdapter {
     this.runtimeDir = path.join(dataDir, 'runtime');
     this.intentPath = path.join(this.runtimeDir, `${this.service}-intent.json`);
     this.processPath = path.join(this.runtimeDir, `${this.service}-process.json`);
+  }
+
+  get codexBridgeEnabled() {
+    if (typeof this._getCodexBridgeEnabled === 'function') {
+      try {
+        return this._getCodexBridgeEnabled() !== false;
+      } catch {
+        return true;
+      }
+    }
+    return this._codexBridgeEnabled !== false;
   }
 
   _readCurrentConfigRecord() {
@@ -1465,7 +1665,7 @@ class ServiceAdapter {
         inheritedEnvironment: buildSafePinnedEnv({
           ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
           ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-        }),
+        }, { codexBridgeEnabled: this.codexBridgeEnabled }),
         serviceEnvironment: serviceEnv,
         controlPlaneEnvironment: { CONTROL_PLANE_API_KEY: snapshot.credential.apiKey },
         httpPlan: snapshot.desiredPlan
@@ -1494,7 +1694,7 @@ class ServiceAdapter {
         inheritedEnvironment: buildSafePinnedEnv({
           ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
           ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-        }),
+        }, { codexBridgeEnabled: this.codexBridgeEnabled }),
         serviceEnvironment: serviceEnv,
         controlPlaneEnvironment: { CONTROL_PLANE_API_KEY: snapshot.credential.apiKey }
       });
@@ -1790,7 +1990,7 @@ class ServiceAdapter {
             inheritedEnvironment: buildSafePinnedEnv({
               ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
               ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-            }),
+            }, { codexBridgeEnabled: this.codexBridgeEnabled }),
             serviceEnvironment: {
               HTTP_PROXY: DEFAULT_PROXY,
               HTTPS_PROXY: DEFAULT_PROXY,
@@ -1814,7 +2014,7 @@ class ServiceAdapter {
             inheritedEnvironment: buildSafePinnedEnv({
               ...(this.paths?.appData ? { APPDATA: this.paths.appData } : {}),
               ...(this.paths?.userProfile ? { USERPROFILE: this.paths.userProfile } : {})
-            }),
+            }, { codexBridgeEnabled: this.codexBridgeEnabled }),
             serviceEnvironment: restoredServiceEnv,
             controlPlaneEnvironment: cpEnv
           });

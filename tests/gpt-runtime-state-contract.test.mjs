@@ -497,7 +497,10 @@ describe('GPT Runtime State Contract & Regression Suite', () => {
         activeProfileRevision: 42,
         activeServiceRevision: 1,
         pendingApply: false,
-        observation: normalizeObservation(null)
+        observation: normalizeObservation(null),
+        // Additive since concurrent multi-profile instances (contract §4): always an
+        // array, empty here because this harness supplies no instance rows.
+        instances: []
       });
     });
 
@@ -530,7 +533,10 @@ describe('GPT Runtime State Contract & Regression Suite', () => {
         activeProfileRevision: 7,
         activeServiceRevision: 2,
         pendingApply: true,
-        observation: normalizeObservation(null)
+        observation: normalizeObservation(null),
+        // Additive (contract §4): GET /api/mcps must carry the per-instance rows or
+        // the console cannot render them. Empty here — this harness supplies none.
+        instances: []
       });
     });
 

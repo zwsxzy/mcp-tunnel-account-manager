@@ -183,21 +183,27 @@
             <!-- Step 1: Target Services (Dynamic from Registered MCPs) -->
             <div class="control-box">
               <label class="control-legend">1. 选择目标生效服务（可单选或多选）</label>
-              <div id="switch-targets-container" class="checkbox-group">
+              <div id="switch-targets-container" class="checkbox-group scroll-area">
                 <!-- Dynamically populated from registered MCPs -->
                 <div class="loading-placeholder-sm">正在加载注册的 MCP 服务...</div>
               </div>
             </div>
 
-            <!-- Step 2: Target Profile -->
+            <!-- Step 2: Target Profile (multi-select via checkboxes) -->
             <div class="control-box">
-              <label class="control-legend" for="switch-profile-select">2. 选择待激活配置文件</label>
-              <div class="select-wrapper">
-                <select id="switch-profile-select" class="form-select">
-                  <option value="">-- 请选择配置文件 --</option>
-                </select>
+              <label class="control-legend">2. 选择待激活配置文件（可多选并行启动）</label>
+              <div id="switch-profiles-list" class="checkbox-group profile-multi-list scroll-area">
+                <div class="loading-placeholder-sm">正在加载配置文件...</div>
               </div>
               <div id="switch-selected-profile-info" class="selected-profile-preview"></div>
+              <button id="btn-parallel-start" class="btn btn-primary btn-sm" style="margin-top:8px; width:100%;">
+                ▶ 并行启动所选账号
+              </button>
+              <div id="parallel-progress" class="progress-panel hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div class="progress-track"><div id="parallel-progress-fill" class="progress-fill"></div></div>
+                <div class="progress-label" id="parallel-progress-text">准备中…</div>
+              </div>
+              <span class="action-hint" style="display:block; margin-top:6px;">勾选多个账号后点击上方按钮：每个账号会在「1」中勾选的服务上各启动一个自己的 tunnel-client。</span>
             </div>
 
             <!-- Step 3: Trigger Action -->
@@ -209,7 +215,14 @@
                 </svg>
                 <span>立即切换</span>
               </button>
-              <span class="action-hint">切换包含健康校验与自动回滚保障</span>
+              <button id="btn-stop-all-tunnel-clients" class="btn btn-danger btn-lg" style="margin-top:8px; width:100%;">
+                ■ 一键关闭所有 tunnel-client
+              </button>
+              <div id="stop-all-progress" class="progress-panel hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div class="progress-track"><div id="stop-all-progress-fill" class="progress-fill"></div></div>
+                <div class="progress-label" id="stop-all-progress-text">准备中…</div>
+              </div>
+              <span class="action-hint">「立即切换」走热切换（含健康校验与自动回滚）；「一键关闭」强制终止本机全部 tunnel-client，并复位恢复闸门。</span>
             </div>
           </div>
 
@@ -291,6 +304,7 @@
               <span>正在加载配置文件...</span>
             </div>
           </div>
+          <div id="profiles-pager" class="pager hidden"></div>
         </section>
       </div>
 
@@ -332,7 +346,7 @@
                 动态管理本地 Stdio 进程与远程 HTTP/SSE MCP 服务，查看实际生效配置路径与运行状态，支持安全启停与注册移除。
               </p>
               <p id="mcps-instance-legend" class="card-description instance-section-legend">
-                每个 MCP 服务可同时运行多个账号实例：展开服务卡片中的“多账号实例”区块，即可查看各账号实例的状态、PID、隧道 ID 与本地端口，并独立启动 / 停止 / 重启单个账号的隧道进程。
+                每个 MCP 服务下，多个账号可各自启动自己的 tunnel-client 并行运行：展开服务卡片中的“账号隧道”区块，即可查看每个账号隧道进程的状态、PID、隧道 ID 与本地端口，并独立启动 / 停止 / 重启。
               </p>
             </div>
             <div class="header-action-group">
@@ -359,6 +373,29 @@
               <div class="spinner"></div>
               <span>正在加载注册的 MCP 服务...</span>
             </div>
+          </div>
+          <div id="mcps-pager" class="pager hidden"></div>
+        </section>
+
+        <!-- Codex 桥接开关 -->
+        <section class="card section-card codex-bridge-section">
+          <div class="card-header">
+            <div>
+              <h2 class="section-title">Codex 桥接</h2>
+              <p class="card-description">
+                tunnel-client 在子进程 PATH 中发现 codex 时，会自动拉起 <code>codex app-server</code> 作为桥接。
+                每份约占用 96 MB 内存，并会弹出控制台窗口。关闭后启动的隧道将从 PATH 中移除 npm 目录，
+                不再拉起该桥接。MCP 工具调用不受影响。
+              </p>
+            </div>
+          </div>
+          <div class="codex-bridge-row">
+            <label class="toggle-wrap" for="codex-bridge-toggle">
+              <input type="checkbox" id="codex-bridge-toggle" class="toggle-input">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              <span class="toggle-label" id="codex-bridge-label">读取中…</span>
+            </label>
+            <span class="codex-bridge-hint" id="codex-bridge-hint"></span>
           </div>
         </section>
 

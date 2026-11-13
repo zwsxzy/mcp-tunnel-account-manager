@@ -2092,9 +2092,13 @@ test('strict verification never fabricates process identity or uses a saved PID 
 test('production Windows launch uses an inheritable hidden native console and never replays an unacknowledged launch', () => {
   const source = fs.readFileSync(new URL('../src/adapters/index.mjs', import.meta.url), 'utf8');
   const native = fs.readFileSync(new URL('../scripts/process-control.ps1', import.meta.url), 'utf8');
-  assert.match(source, /spawn\('powershell', args,\s*\{\s*stdio:[^}]+windowsHide:\s*true/s);
+  // The standalone helper is spawned through the INJECTABLE seam (`spawnHelper`),
+  // which defaults to node's `spawn`; the safety-relevant part of this assertion is
+  // that it stays hidden with piped stdio and never inherits the console.
+  assert.match(source, /spawnHelper = spawn\b/);
+  assert.match(source, /spawnHelper\('powershell', args,\s*\{\s*stdio:\s*\['ignore',\s*'pipe',\s*'pipe'\],\s*windowsHide:\s*true/s);
   assert.match(source, /if \(process.platform === 'win32'\) \{\s*const payload = \{[^}]+hiddenConsole: true/s);
-  assert.match(source, /executeHelper\('Launch', \{ LaunchPayload: payload \}\)/);
+  assert.match(source, /executeHelper\('Launch', \{ LaunchPayload: payload, service \}\)/);
   assert.match(source, /if \(action === 'Launch'\) \{\s*throw new SwitchFault\('PROCESS_LAUNCH_UNCONFIRMED'/);
   assert.match(native, /uint flags = hiddenConsole \? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW/);
   assert.match(native, /si\.wShowWindow = 0/);

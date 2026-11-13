@@ -329,6 +329,22 @@ export async function runAllTests(testFiles, options = {}) {
     console.log(`\n=== Running Heavy Test Suite (${heavy.length} file(s), concurrency: ${heavyConcurrency} sequentially) ===`);
     for (const heavyFile of heavy) {
       const relName = path.relative(projectRoot, heavyFile);
+      /*
+       * Default per-FILE budget for this heavy file.
+       *
+       * tests/process-control.test.mjs runs 35 separate `powershell -NoProfile
+       * -File scripts/process-control.ps1` invocations (incl. CIM/process-handle
+       * queries) strictly serially; measured wall time is 139.5s-158.6s, so a
+       * 150000ms budget sits ON the workload and trips on ordinary machine speed
+       * variance -- it is not a hung test (standalone run: 7/7 pass, exit 0).
+       * Windows only, and only this file. `options.heavyTimeoutMs` still wins when
+       * a caller passes it, so the existing programmatic override is preserved.
+       */
+      const heavyBaseName = String(heavyFile).replaceAll('\\', '/').split('/').pop().toLowerCase();
+      const fileDefaultHeavyTimeoutMs =
+        (process.platform === 'win32' && heavyBaseName === 'process-control.test.mjs')
+          ? 240000
+          : 150000;
       console.log(`\n[Heavy Test] >>> ${relName}`);
       const heavyArgs = [
         ...nodeTestOptions,
@@ -336,7 +352,7 @@ export async function runAllTests(testFiles, options = {}) {
       ];
       const heavyRun = await spawnTrackedNodeTest(heavyArgs, {
         cwd: projectRoot,
-        timeoutMs: options.heavyTimeoutMs || 150000,
+        timeoutMs: options.heavyTimeoutMs || fileDefaultHeavyTimeoutMs,
         label: relName,
         watcher
       });

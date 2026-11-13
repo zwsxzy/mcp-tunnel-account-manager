@@ -9,9 +9,19 @@ import {
   rollbackOwnedResources
 } from './core/runner-startup.mjs';
 import { classifyQueuedWork, missingReferenceDisposition } from './core/work-item-routing.mjs';
+import { createResourcePolicy } from './core/resource-policy.mjs';
 import * as adaptersModule from './adapters/index.mjs';
 
-export function createRunner({ repo, adapters, adapterProvider, instanceAdapterProvider, dataDir, vault }) {
+export function createRunner({
+  repo,
+  adapters,
+  adapterProvider,
+  instanceAdapterProvider,
+  dataDir,
+  vault,
+  resourcePolicy = null,
+  resourcePolicyOptions = {}
+}) {
   if (!repo || typeof repo !== 'object') {
     throw new TypeError('A valid repo object is required to create a runner');
   }
@@ -70,6 +80,26 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
   let drainPromise = null;
   let pendingNotify = false;
   let lastError = null;
+  let recoveryItems = null;
+  let recoveryTask = null;
+  let recoveryState = {
+    status: 'idle',
+    pending: false,
+    failed: false,
+    mode: 'sync',
+    total: 0,
+    done: 0,
+    error: null
+  };
+
+  // ONE shared admission policy per manager. Every start entry point (legacy
+  // action, registry action, instance action, switch) reserves from this same
+  // object, so N concurrent starts cannot each be admitted against the same
+  // free-memory reading.
+  if (resourcePolicy && (typeof resourcePolicy.admitStart !== 'function' || typeof resourcePolicy.release !== 'function')) {
+    throw new TypeError('A valid resourcePolicy with admitStart/release is required');
+  }
+  const policy = resourcePolicy || createResourcePolicy(resourcePolicyOptions);
 
   // Mutual exclusion chain for switch-core executeOperation and stop actions
   let exclusiveLockChain = Promise.resolve();
@@ -86,6 +116,7 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
     adapters: adapters || {},
     adapterProvider: resolvedAdapterProvider,
     withExclusiveLock,
+    resourcePolicy: policy,
     vault
   };
 
@@ -104,7 +135,16 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
     try {
       resolvedInstanceAdapterProvider = adaptersModule.createInstanceAdapterProvider({
         dataDir: resolvedDataDir,
-        vault
+        vault,
+        resolveDefinition: async (serviceId) => {
+          try {
+            if (typeof repo?.getDefinition === 'function') return await repo.getDefinition(serviceId);
+            if (typeof repo?.registry?.getDefinition === 'function') return await repo.registry.getDefinition(serviceId);
+            if (typeof repo?.getMcp === 'function') return await repo.getMcp(serviceId);
+            if (typeof repo?.registry?.getMcp === 'function') return await repo.registry.getMcp(serviceId);
+          } catch (_) {}
+          return null;
+        }
       });
     } catch (_) {
       // Production data dirs are refused by the instance adapter's isolation
@@ -209,21 +249,36 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
           Boolean(instanceAction.instanceId || instanceAction.instance_id);
 
         if (instanceScoped) {
-          await withExclusiveLock(async () => {
-            await runInstanceLifecycleAction({
-              repo,
-              // Deliberately NOT resolvedAdapterProvider: a legacy service
-              // adapter must never be driven by an instance action.
-              adapterProvider: resolvedInstanceAdapterProvider,
-              actionId: id,
-              vault
+          const instanceId = instanceAction.instanceId || instanceAction.instance_id;
+          try {
+            await withExclusiveLock(async () => {
+              await runInstanceLifecycleAction({
+                repo,
+                // Deliberately NOT resolvedAdapterProvider: a legacy service
+                // adapter must never be driven by an instance action.
+                adapterProvider: resolvedInstanceAdapterProvider,
+                resourcePolicy: policy,
+                actionId: id,
+                vault
+              });
             });
-          });
+          } finally {
+            // The instance provider caches by instanceId. Releasing it here (on
+            // success AND failure) drops only the cached adapter object; it never
+            // terminates the process. The legacy provider below is released with
+            // the ACTION id, which is what registry-provider.release expects.
+            if (typeof resolvedInstanceAdapterProvider?.release === 'function') {
+              try {
+                resolvedInstanceAdapterProvider.release(instanceId);
+              } catch (_) {}
+            }
+          }
         } else {
           await withExclusiveLock(async () => {
             await runMcpLifecycleAction({
               repo,
               adapterProvider: resolvedAdapterProvider,
+              resourcePolicy: policy,
               actionId: id,
               vault
             });
@@ -330,7 +385,64 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
     return drainPromise;
   }
 
-  async function start() {
+  async function runRecovery(items) {
+    recoveryState.status = 'running';
+    recoveryState.pending = true;
+    try {
+      for (const item of items) {
+        if (!started) break;
+        await dispatchTask(item.id, item.rawItem);
+        recoveryState.done += 1;
+      }
+      recoveryState.status = 'ready';
+      recoveryState.pending = false;
+      recoveryState.failed = false;
+      recoveryState.error = null;
+      if (pendingNotify && started && !stopping) {
+        pendingNotify = false;
+        notify();
+      }
+    } catch (error) {
+      lastError = error;
+      // Fail-closed: the gate stays shut (mutations answered 503) instead of
+      // letting new work race an unverified partial recovery.
+      recoveryState.status = 'failed';
+      recoveryState.pending = false;
+      recoveryState.failed = true;
+      recoveryState.error = error?.message ? String(error.message) : String(error);
+      throw error;
+    }
+  }
+
+  function beginBackgroundRecovery() {
+    if (recoveryTask) return recoveryTask;
+    if (!recoveryItems || recoveryItems.length === 0) return Promise.resolve();
+    const items = recoveryItems;
+    recoveryItems = null;
+    recoveryState.mode = 'background';
+    recoveryTask = runRecovery(items)
+      .catch(() => {})
+      .finally(() => { recoveryTask = null; });
+    return recoveryTask;
+  }
+
+  function getRecoveryState() {
+    // `ready` is the affirmative readiness bit a health check can consume; the
+    // console keeps reading `gated` (the safety gate). Both answers stay
+    // available so readiness never has to be inferred from the absence of a gate.
+    const gated = recoveryState.pending || recoveryState.status === 'running' || recoveryState.failed;
+    return {
+      ...recoveryState,
+      gated,
+      ready: !gated && recoveryState.status === 'ready'
+    };
+  }
+
+  function whenRecoverySettled() {
+    return recoveryTask || Promise.resolve();
+  }
+
+  async function start({ backgroundRecovery = false } = {}) {
     if (started) return;
     if (startPromise) return await startPromise;
 
@@ -353,8 +465,11 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
         stopping = false;
         lastError = null;
 
-        // 2. Startup recovery: recover non-terminal switch ops and non-terminal stop actions before draining new queue
+        // 2. Foreground: storage validation and classification of every pending
+        //    recovery item. The actual recovery (which may launch/stop clients)
+        //    is what can be deferred until after `listen` in background mode.
         const pendingItems = await fetchWorkQueue();
+        const items = [];
         if (Array.isArray(pendingItems)) {
           for (const rawItem of pendingItems) {
             const id = typeof rawItem === 'string' ? rawItem : (rawItem?.id || rawItem?.operationId);
@@ -366,9 +481,26 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
             const work = await loadWorkRecord({ repo, id, kind: workKind });
 
             // Recover nonQUEUED nonterminal before queued new work
-            if (work.needsRecovery) {
-              await dispatchTask(id, rawItem);
-            }
+            if (work.needsRecovery) items.push({ id, rawItem });
+          }
+        }
+
+        recoveryState = {
+          status: items.length === 0 ? 'ready' : 'pending',
+          pending: items.length > 0,
+          failed: false,
+          mode: backgroundRecovery ? 'background' : 'sync',
+          total: items.length,
+          done: 0,
+          error: null
+        };
+
+        if (items.length > 0) {
+          if (backgroundRecovery) {
+            // The caller (main) invokes beginBackgroundRecovery() after listen.
+            recoveryItems = items;
+          } else {
+            await runRecovery(items);
           }
         }
       }, async () => {
@@ -377,6 +509,11 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
         drainPromise = null;
         pendingNotify = false;
         currentOperationId = null;
+        recoveryItems = null;
+        recoveryState = {
+          status: 'idle', pending: false, failed: false,
+          mode: recoveryState.mode, total: 0, done: 0, error: null
+        };
         await rollbackOwnedResources(releases);
       });
     };
@@ -391,6 +528,12 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
 
   function notify() {
     if (!started || stopping) return;
+    // Unified recovery gate: while startup recovery is pending/running/failed no
+    // NEW work is dispatched. Read-only routes still answer from storage.
+    if (recoveryState.pending || recoveryState.status === 'running' || recoveryState.failed) {
+      pendingNotify = true;
+      return;
+    }
     if (drainPromise) {
       pendingNotify = true;
       return;
@@ -412,6 +555,14 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
     }
     stopping = true;
 
+    // A deferred recovery may still be launching/stopping clients. Await it so
+    // close cannot race an owned side effect, then reclaim our own budget.
+    if (recoveryTask) {
+      try { await recoveryTask; } catch (_) {}
+      recoveryTask = null;
+    }
+    recoveryItems = null;
+
     // Drain existing queued operations cleanly (do not await startPromise)
     if (drainPromise) {
       try {
@@ -425,6 +576,7 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
 
     started = false;
     stopping = false;
+    try { policy.close?.('POLICY_CLOSED'); } catch (_) {}
 
     // Release daemon lock
     if (daemonLock) {
@@ -445,6 +597,8 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
       locked: Boolean(daemonLock),
       currentOperationId,
       dataDir: resolvedDataDir,
+      recovery: getRecoveryState(),
+      resourcePolicy: typeof policy.getStats === 'function' ? policy.getStats() : null,
       lastError: lastError ? lastError.message : null
     };
   }
@@ -454,6 +608,9 @@ export function createRunner({ repo, adapters, adapterProvider, instanceAdapterP
     notify,
     stop,
     getStatus,
+    beginBackgroundRecovery,
+    getRecoveryState,
+    whenRecoverySettled,
     deps
   };
 }

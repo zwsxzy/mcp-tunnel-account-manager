@@ -218,20 +218,26 @@ export async function startManager({
     // 4. Adapters layer (uses adapterFactory if provided for in-process test injection, otherwise createAdapters)
     // Note: Adapters are NOT registered in releases so failure cannot kill tunnel clients.
     const resolvedAdapterVault = adapterOptions?.vault || vault;
+    // Codex 桥接开关：动态传递 getter 函数，保证每次启动/恢复隧道时实时读取最新数据库设置。
+    const adapterPaths = {
+      ...(adapterOptions?.paths || {}),
+      getCodexBridgeEnabled: () => (typeof store?.getCodexBridgeEnabled === 'function' ? store.getCodexBridgeEnabled() : true),
+    };
+    const resolvedAdapterOptions = { ...adapterOptions, paths: adapterPaths };
     const adapters = typeof adapterFactory === 'function'
       ? await adapterFactory({
           dataDir,
           vault: resolvedAdapterVault,
           store,
           security,
-          ...adapterOptions
+          ...resolvedAdapterOptions
         })
       : await createAdapters({
           dataDir,
           vault: resolvedAdapterVault,
           store,
           security,
-          ...adapterOptions
+          ...resolvedAdapterOptions
         });
 
     let adapterProvider = restOptions.adapterProvider;
@@ -265,7 +271,25 @@ export async function startManager({
           vault: resolvedAdapterVault,
           store,
           security,
-          ...adapterOptions
+          ...adapterOptions,
+          // Without the service definition the instance adapter cannot tell an
+          // HTTP service from a stdio one, so it launched the DSH bridge without
+          // --mcp.server-url and tunnel-client refused to start.
+          definitions: {
+            ...((adapterOptions && adapterOptions.definitions) || {}),
+            ...(typeof store?.getDefinition === 'function'
+              ? {}
+              : {})
+          },
+          resolveDefinition: async (serviceId) => {
+            try {
+              if (typeof store?.getDefinition === 'function') return await store.getDefinition(serviceId);
+              if (typeof store?.registry?.getDefinition === 'function') return await store.registry.getDefinition(serviceId);
+              if (typeof store?.getMcp === 'function') return await store.getMcp(serviceId);
+              if (typeof store?.registry?.getMcp === 'function') return await store.registry.getMcp(serviceId);
+            } catch (_) {}
+            return null;
+          }
         });
       } catch (_) {
         instanceAdapterProvider = null;
@@ -310,7 +334,12 @@ export async function startManager({
     }
 
     if (runner && typeof runner.start === 'function') {
-      await runner.start();
+      // Foreground keeps the daemon lock, storage validation and recovery
+      // classification. The actual recovery is deferred until after listen (see
+      // below) and blocks every mutating entry through the runner recovery gate
+      // until it settles. `start()` without options keeps the old synchronous
+      // behaviour for runner unit tests.
+      await runner.start({ backgroundRecovery: true });
     }
 
     // 5b. Observer layer
@@ -563,7 +592,14 @@ export async function startManager({
                       idVerified = false;
                     }
                   } else {
-                    idVerified = true;
+                    // No verifier means no proof of identity. This used to fall
+                    // through to `idVerified = true`, so an adapter without a
+                    // process controller published a `running` row for a pid that
+                    // was merely alive -- a recycled pid (or a foreign process)
+                    // then read as this service's verified tunnel and could be
+                    // stopped/restarted. Absence of a verifier is not evidence, so
+                    // the row degrades to `unmanaged` below instead.
+                    idVerified = false;
                   }
                 }
 
@@ -578,7 +614,11 @@ export async function startManager({
                     observedAt: new Date().toISOString(),
                     expiresAt: new Date(Date.now() + 90000).toISOString(),
                     reasonCode: 'process_verified_running',
-                    lastExitCode: null
+                    lastExitCode: null,
+                    // A live client is the opposite of proven absence; state it so
+                    // a stale `true` can never make the ALREADY_STOPPED guard fire
+                    // on a running tunnel.
+                    absenceVerified: false
                   };
                 } else if (isLive && !isOwned) {
                   tcStatus = {
@@ -591,7 +631,9 @@ export async function startManager({
                     observedAt: new Date().toISOString(),
                     expiresAt: new Date(Date.now() + 90000).toISOString(),
                     reasonCode: 'external_process_unmanaged',
-                    lastExitCode: null
+                    lastExitCode: null,
+                    // Live but not ours: definitively not an absence.
+                    absenceVerified: false
                   };
                 } else if (inspected?.absenceVerified) {
                   tcStatus = {
@@ -604,7 +646,13 @@ export async function startManager({
                     observedAt: new Date().toISOString(),
                     expiresAt: new Date(Date.now() + 90000).toISOString(),
                     reasonCode: 'process_stopped',
-                    lastExitCode: null
+                    lastExitCode: null,
+                    // The only branch allowed to claim absence: the inspection itself
+                    // reported running === false with no external conflict. This is
+                    // the authoritative source the stop noop / removal guard consume;
+                    // without it `absenceVerified` was written by nothing in the
+                    // production tree and the guard was unreachable dead code.
+                    absenceVerified: true
                   };
                 } else {
                   // A missing manager identity record or unobserved process is NOT process_stopped!
@@ -618,7 +666,10 @@ export async function startManager({
                     observedAt: new Date().toISOString(),
                     expiresAt: new Date(Date.now() + 90000).toISOString(),
                     reasonCode: srv.binding?.type === 'http' ? 'external_http_unmanaged' : 'external_process_unobserved',
-                    lastExitCode: null
+                    lastExitCode: null,
+                    // Not observed is not absent: keep the guard from reading this
+                    // row as proof that the tunnel is gone.
+                    absenceVerified: false
                   };
                 }
                 if (typeof observer.setTunnelClient === 'function') {
@@ -837,6 +888,13 @@ export async function startManager({
     const address = typeof server?.address === 'function' ? server.address() : null;
     const actualPort = typeof address === 'object' && address ? address.port : port;
     const url = `http://${host}:${actualPort}`;
+
+    // Recovery is scheduled only now that the console can answer health/state
+    // reads. It is tracked: runner.stop() (registered as a release) awaits it, so
+    // no background task outlives the manager and leaks a timer.
+    if (runner && typeof runner.beginBackgroundRecovery === 'function') {
+      Promise.resolve(runner.beginBackgroundRecovery()).catch(() => {});
+    }
 
     // Auto-import coordinator: deduplicated, no overlapping cycles, handles startup + authorized source changes
     let autoImportRunning = null;

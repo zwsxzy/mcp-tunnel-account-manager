@@ -72,27 +72,88 @@ export function instanceHealthUrlFileName(instanceId) {
 }
 
 /**
+ * Resolves a path to its real on-disk form, tolerating not-yet-existing tails.
+ *
+ * `path.resolve()` is purely LEXICAL: it normalises case, separators and `..`,
+ * but it never consults the filesystem. Windows therefore offers several ways to
+ * name one directory without spelling it out, and every one of them defeats a
+ * plain string comparison:
+ *
+ *   - 8.3 short names   `MCPTUN~1`  -> `McpTunnelAccountManager`
+ *   - junctions/symlinks `link -> ...\McpTunnelAccountManager`
+ *
+ * So any path taking part in the production check is first resolved against the
+ * filesystem. Not-yet-existing tails are preserved by resolving the nearest
+ * existing ancestor and re-appending the remainder, which is the normal case
+ * here because an instance data directory is usually created on demand.
+ *
+ * Falls back to a plain resolve only when no ancestor can be resolved at all.
+ */
+export function realResolve(target) {
+  let original;
+  try {
+    original = path.resolve(String(target));
+  } catch {
+    return String(target);
+  }
+
+  let current = original;
+  const tail = [];
+  for (let depth = 0; depth < 64; depth += 1) {
+    try {
+      const real = fs.realpathSync.native(current).replace(/[\\/]+$/, '');
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return original;
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+  return original;
+}
+
+/**
+ * True when `candidate` IS `root` or lives anywhere BENEATH it.
+ *
+ * Both sides go through `realResolve()` so short names and reparse points are
+ * compared as the directories they actually are. The trailing separator in the
+ * prefix test is what stops `...\McpTunnelAccountManager-dev` from being
+ * mistaken for a child of `...\McpTunnelAccountManager`.
+ */
+function isSameOrDescendant(candidate, root) {
+  const left = realResolve(candidate).toLowerCase().replace(/[\\/]+$/, '');
+  const right = realResolve(root).toLowerCase().replace(/[\\/]+$/, '');
+  if (!left || !right) return false;
+  return left === right || left.startsWith(`${right}${path.sep}`);
+}
+
+/**
  * Refuses data directories that belong to the live production installation.
  * Concurrent instances must never be written next to the production database,
  * and never inside the production tunnel-client profile directory.
+ *
+ * Both protected roots use the SAME test (equal-or-descendant). An earlier
+ * revision checked only equality against the data directory, which accepted
+ * `...\McpTunnelAccountManager\sub` and would have written instance profiles
+ * inside the production data directory.
  */
 export function assertIsolatedInstanceDataDir(dataDir) {
   if (typeof dataDir !== 'string' || dataDir.trim() === '' || dataDir.includes('\0')) {
     throw new InstanceFault('INVALID_INSTANCE', 'dataDir is required for instance adapters');
   }
   const resolved = path.resolve(dataDir);
-  const lower = resolved.toLowerCase();
 
   if (process.env.LOCALAPPDATA) {
-    const productionDataDir = path.resolve(process.env.LOCALAPPDATA, 'McpTunnelAccountManager').toLowerCase();
-    if (lower === productionDataDir) {
+    const productionDataDir = path.resolve(process.env.LOCALAPPDATA, 'McpTunnelAccountManager');
+    if (isSameOrDescendant(resolved, productionDataDir)) {
       throw new InstanceFault('INVALID_INSTANCE', 'production data directory is not allowed for concurrent instances');
     }
   }
 
   if (process.env.APPDATA) {
-    const productionProfiles = path.resolve(process.env.APPDATA, 'tunnel-client').toLowerCase();
-    if (lower === productionProfiles || lower.startsWith(`${productionProfiles}${path.sep}`)) {
+    const productionProfiles = path.resolve(process.env.APPDATA, 'tunnel-client');
+    if (isSameOrDescendant(resolved, productionProfiles)) {
       throw new InstanceFault('INVALID_INSTANCE', 'production tunnel-client profile directory is not allowed for concurrent instances');
     }
   }
@@ -556,6 +617,50 @@ export class InstanceAdapter {
    * `assertVerifiedReceipt` / `assertRestoredReceipt` keep accepting it unchanged),
    * plus the additive instance fields the instance lifecycle/store records.
    */
+  /**
+   * Seeds this instance's profile YAML from the SERVICE's real (production) YAML.
+   *
+   * An instance owns its own profile file, so on a first start that file does not
+   * exist yet. Generating it from scratch loses the service's `mcp.commands`
+   * (e.g. antigravity needs its real python command, the DSH bridge its own
+   * command) and the tunnel-client then fails to start the MCP subprocess, which
+   * surfaces as VERIFY_FAILED. Copying the production YAML first keeps every
+   * command/proxy setting intact; only control_plane is rewritten afterwards.
+   */
+  _sourceServiceConfigPath() {
+    const stemByService = { 'overleaf-mcp': 'overleaf', 'antigravity-mcp': 'antigravity-local' };
+    const stem = stemByService[this.service] || this.service;
+    const appData = this.paths?.appData
+      || process.env.APPDATA
+      || path.join(this.paths?.userProfile || process.env.USERPROFILE || '', 'AppData', 'Roaming');
+    const candidates = [
+      path.join(appData, 'tunnel-client', `${stem}.yaml`),
+      this.definition?.locations?.effectiveConfigPath || null
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+      try { if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate; } catch (_) {}
+    }
+    return null;
+  }
+
+  _ensureSeedConfig() {
+    try {
+      if (fs.existsSync(this.configPath)) {
+        const current = fs.readFileSync(this.configPath, 'utf8');
+        // Already seeded (has an mcp block) — leave it alone.
+        if (current.trim() && /(^|\r?\n)mcp:\s*(\r?\n|$)/.test(current)) return;
+      }
+      const source = this._sourceServiceConfigPath();
+      if (!source) return;
+      const raw = fs.readFileSync(source, 'utf8');
+      if (!raw.trim()) return;
+      fs.mkdirSync(path.dirname(this.configPath), { recursive: true });
+      fs.writeFileSync(this.configPath, raw, 'utf8');
+    } catch (_) {
+      // Seeding is best-effort: a failure here falls back to the generated default.
+    }
+  }
+
   async prepare({ operationId, credential, profileId = null, instanceId = null } = {}) {
     if (profileId !== null && profileId !== undefined && String(profileId) !== this.profileId) {
       throw new InstanceFault('INVALID_INSTANCE', 'prepare() was called for a different profile');
@@ -564,6 +669,7 @@ export class InstanceAdapter {
       throw new InstanceFault('INVALID_INSTANCE', 'prepare() was called for a different instance');
     }
     this._syncDelegateHealth();
+    this._ensureSeedConfig();
     const snapshot = await this._delegate.prepare({ operationId, credential, profileId: this.profileId });
 
     snapshot.profileId = this.profileId;
@@ -855,7 +961,8 @@ export function createInstanceAdapterProvider(options = {}) {
     healthURLs = null,
     healthURL = null,
     runtimeCommand,
-    scriptPath = null
+    scriptPath = null,
+    resolveDefinition: resolveDefinitionFn = null
   } = options || {};
 
   const resolvedDataDir = assertIsolatedInstanceDataDir(dataDir);
@@ -870,18 +977,30 @@ export function createInstanceAdapterProvider(options = {}) {
   });
 
   const cache = new Map();
+  const maxEntries = Number.isSafeInteger(options.maxEntries) && options.maxEntries > 0
+    ? options.maxEntries : 64;
+  const cacheStats = { hits: 0, misses: 0, evictions: 0, releases: 0 };
 
   const provider = async (op, serviceId, profileId) => {
     if (!isMcpServiceId(serviceId)) throw new InstanceFault('INVALID_SERVICE');
     const target = assertInstanceTarget({ serviceId, profileId });
 
     const cached = cache.get(target.instanceId);
-    if (cached) return cached;
+    if (cached) { cacheStats.hits += 1; return cached; }
+    cacheStats.misses += 1;
+
+    // Definition resolution order: the async resolver (live store) first, then the
+    // static map / operation snapshot. Without a definition an HTTP service looks
+    // like stdio, which made tunnel-client refuse to start (missing --mcp.server-url).
+    let definition = resolveDefinition(definitions, target.serviceId, op);
+    if (!definition && typeof resolveDefinitionFn === 'function') {
+      try { definition = await resolveDefinitionFn(target.serviceId); } catch (_) { definition = null; }
+    }
 
     const adapter = createInstanceAdapter({
       serviceId: target.serviceId,
       profileId: target.profileId,
-      definition: resolveDefinition(definitions, target.serviceId, op),
+      definition,
       dataDir: resolvedDataDir,
       paths: resolvedPaths,
       probe: resolvedProbe,
@@ -890,12 +1009,22 @@ export function createInstanceAdapterProvider(options = {}) {
       healthURL: (healthURLs && healthURLs[target.instanceId]) || healthURL || null
     });
 
+    // Bounded cache for non-runner entry points: an unbounded map of instance
+    // adapters is a slow leak for long-lived consoles. Eviction drops a cached
+    // OBJECT only; it never stops a process and never rewrites runtime state.
+    while (cache.size >= maxEntries) {
+      const oldest = cache.keys().next();
+      if (oldest.done) break;
+      cache.delete(oldest.value);
+      cacheStats.evictions += 1;
+    }
     cache.set(target.instanceId, adapter);
     return adapter;
   };
 
   provider.release = (instanceId) => {
-    if (instanceId) cache.delete(instanceId);
+    if (!instanceId) return;
+    if (cache.delete(instanceId)) cacheStats.releases += 1;
   };
 
   provider.clear = () => {
@@ -903,6 +1032,8 @@ export function createInstanceAdapterProvider(options = {}) {
   };
 
   provider.has = (instanceId) => cache.has(instanceId);
+
+  provider.stats = () => ({ ...cacheStats, size: cache.size, maxEntries });
 
   Object.defineProperty(provider, 'size', {
     get: () => cache.size,

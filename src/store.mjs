@@ -6,6 +6,7 @@ import { attachRegistry } from './mcp-registry-store.mjs';
 import { safeFailureReason } from './core/switch-core.mjs';
 import { isMcpServiceId } from './core/mcp-registry-policy.mjs';
 import { buildInstanceId, parseInstanceId } from './core/concurrent-instances.mjs';
+import { isProcessAlive } from './core/process-liveness.mjs';
 
 export class StoreError extends Error {
   constructor(message, status = 500, code = 'STORE_ERROR') {
@@ -184,6 +185,11 @@ export function openStore(options = {}) {
       reason_code      TEXT,
       last_exit_code   INTEGER,
       observed_at      TEXT,
+      -- Ownership evidence for THIS instance's process. The UI must not offer
+      -- stop/restart unless the running process is the one we recorded and its
+      -- identity was verified, so these are persisted rather than inferred.
+      owned            INTEGER,
+      identity_verified INTEGER,
       created_at       TEXT NOT NULL,
       updated_at       TEXT NOT NULL
     );
@@ -220,10 +226,47 @@ export function openStore(options = {}) {
   // (it owns the mcp_actions table). The column/index migration lives there so a
   // direct attachRegistry() call also upgrades an existing DB in place.
 
+  // Additive: per-instance ownership evidence. Existing DBs upgrade in place; a
+  // missing column simply reads back as null (=> not owned, not verified), which
+  // keeps the UI's conservative stop/restart gating working until the next action
+  // records real evidence.
+  try {
+    db.exec('ALTER TABLE instance_runtime ADD COLUMN owned INTEGER;');
+  } catch (_) {}
+  try {
+    db.exec('ALTER TABLE instance_runtime ADD COLUMN identity_verified INTEGER;');
+  } catch (_) {}
+
   // Initialize metadata keys if absent
   db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES ('revision', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_gated', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_reason', '')").run();
+
+  /*
+   * Instance-scoped recovery gates.
+   *
+   * The legacy gate above is a single global boolean, which is right for a legacy
+   * whole-service operation (side effects cover every service at once) but wrong
+   * for concurrent instances: one account failing to start would refuse work on
+   * every OTHER account of the service, defeating the point of the feature.
+   *
+   * `scope` is an `instanceId` (`<service>__<profile>`). A row is created when an
+   * instance action ends NEEDS_ATTENTION and removed when that action is
+   * acknowledged. Legacy whole-service gating keeps using the metadata flag above,
+   * so no 'GLOBAL' row is ever written here — there is exactly one source of truth
+   * for each kind of gate.
+   *
+   * The legacy metadata flag is KEPT as the source of truth for whole-service gates
+   * so that existing databases, the UI state payload and the operations path keep
+   * behaving exactly as before.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recovery_gates (
+      scope TEXT PRIMARY KEY,
+      reason TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
 
   // Auto-heal any legacy profiles that were saved with masked tunnel IDs
   if (vault && typeof vault.unseal === 'function' && typeof vault.seal === 'function') {
@@ -291,20 +334,61 @@ export function openStore(options = {}) {
     return row ? parseInt(row.value, 10) : 0;
   }
 
+  /**
+   * Codex 桥接开关。
+   *
+   * tunnel-client 在子进程 PATH 中发现 codex 时会自动拉起 `codex app-server`
+   * 作为桥接，每份约占 96 MB 内存并各带一个控制台窗口。此项为 false 时，
+   * 启动隧道会从 PATH 中移除 npm 目录，使探测不到 codex。
+   *
+   * 默认 true，保持与历史行为一致（升级后不会静默改变隧道形态）。
+   * 读取失败一律回落到 true——宁可多占内存，也不要意外改变隧道能力。
+   */
+  const CODEX_BRIDGE_KEY = 'codex_bridge_enabled';
+
+  function getCodexBridgeEnabled() {
+    try {
+      const row = db.prepare("SELECT value FROM metadata WHERE key = ?").get(CODEX_BRIDGE_KEY);
+      if (!row) return true;
+      return row.value !== '0';
+    } catch {
+      return true;
+    }
+  }
+
+  function setCodexBridgeEnabled(enabled) {
+    const value = enabled ? '1' : '0';
+    db.prepare(
+      "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    ).run(CODEX_BRIDGE_KEY, value);
+    return getCodexBridgeEnabled();
+  }
+
   function getRecoveryState() {
     const row = db.prepare("SELECT value FROM metadata WHERE key = 'recovery_gated'").get();
     const gated = row ? row.value === '1' : false;
-    if (!gated) {
+    const instanceGates = db.prepare('SELECT scope, reason FROM recovery_gates ORDER BY scope ASC').all();
+
+    if (!gated && instanceGates.length === 0) {
       return { gated: false };
     }
+
     const reasonRow = db.prepare("SELECT value FROM metadata WHERE key = 'recovery_reason'").get();
-    const reason = reasonRow?.value || 'Manual recovery required';
+    const legacyReason = reasonRow?.value || '';
+    const reason = gated
+      ? (legacyReason || 'Manual recovery required')
+      : instanceGates.map((gate) => gate.reason).join('; ');
     const match = reason.match(/\b(act_[a-z0-9_-]+|op_[a-z0-9_-]+)\b/i);
-    return {
+
+    const state = {
       gated: true,
       reason,
       actionId: match ? match[1] : null
     };
+    if (instanceGates.length > 0) {
+      state.instances = instanceGates.map((gate) => ({ instanceId: gate.scope, reason: gate.reason }));
+    }
+    return state;
   }
 
   function listNeedsAttentionIds() {
@@ -340,11 +424,21 @@ export function openStore(options = {}) {
       `).run(now, actionId);
 
       const remainingAttentionIds = listNeedsAttentionIds();
+
+      // Acknowledging an instance action closes ONLY that instance's gate, so
+      // sibling accounts stay runnable.
+      if (row.instance_id) {
+        db.prepare('DELETE FROM recovery_gates WHERE scope = ?').run(String(row.instance_id));
+      }
+
       if (clearGate && remainingAttentionIds.length === 0) {
         resetRecoveryGate();
       } else if (remainingAttentionIds.length > 0) {
-        const nextReason = `Recovery gate retained: ${remainingAttentionIds.join(', ')}`;
-        db.prepare("UPDATE metadata SET value = ? WHERE key = 'recovery_reason'").run(nextReason);
+        const legacy = db.prepare("SELECT value FROM metadata WHERE key = 'recovery_gated'").get();
+        if (legacy && legacy.value === '1') {
+          const nextReason = `Recovery gate retained: ${remainingAttentionIds.join(', ')}`;
+          db.prepare("UPDATE metadata SET value = ? WHERE key = 'recovery_reason'").run(nextReason);
+        }
       }
 
       const nextRev = getRevision() + 1;
@@ -363,11 +457,85 @@ export function openStore(options = {}) {
   function resetRecoveryGate() {
     db.prepare("UPDATE metadata SET value = '0' WHERE key = 'recovery_gated'").run();
     db.prepare("UPDATE metadata SET value = '' WHERE key = 'recovery_reason'").run();
+    db.prepare('DELETE FROM recovery_gates').run();
   }
 
-  function assertIdle({ excludeActionId, excludeOperationId } = {}) {
-    const recovery = getRecoveryState();
-    if (recovery.gated) {
+  /**
+   * Full recovery reset: closes the legacy flag, the per-instance gates, and every
+   * work item still parked in NEEDS_ATTENTION.
+   *
+   * `resetRecoveryGate()` alone is not enough after an emergency stop: `assertIdle()`
+   * also refuses new work while an action/operation sits in NEEDS_ATTENTION, so the
+   * console kept answering RECOVERY_GATED even with the metadata flag cleared.
+   * Those stale items are unrecoverable once their processes were killed anyway.
+   */
+  function clearRecoveryState() {
+    return withWriteTransaction(() => {
+      const actions = db.prepare(
+        "UPDATE mcp_actions SET state = 'REJECTED', error_code = COALESCE(error_code, 'RESET_BY_OPERATOR'), updated_at = ? WHERE state = 'NEEDS_ATTENTION'"
+      ).run(new Date().toISOString());
+      const operations = db.prepare(
+        "UPDATE operations SET status = 'REJECTED', updated_at = ? WHERE status = 'NEEDS_ATTENTION'"
+      ).run(new Date().toISOString());
+      resetRecoveryGate();
+      return {
+        clearedActions: actions.changes || 0,
+        clearedOperations: operations.changes || 0
+      };
+    });
+  }
+
+  /**
+   * Opens (or refreshes) a recovery gate. `instanceId` scopes it to one concurrent
+   * instance; omitting it opens the legacy whole-service gate.
+   */
+  function setRecoveryGate(reason, instanceId = null) {
+    if (instanceId) {
+      db.prepare(`
+        INSERT INTO recovery_gates (scope, reason, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(scope) DO UPDATE SET reason = excluded.reason, updated_at = excluded.updated_at
+      `).run(String(instanceId), String(reason), new Date().toISOString());
+      return;
+    }
+    db.prepare("UPDATE metadata SET value = '1' WHERE key = 'recovery_gated'").run();
+    db.prepare("UPDATE metadata SET value = ? WHERE key = 'recovery_reason'").run(String(reason));
+  }
+
+  /** Closes only the gate owned by one instance, leaving siblings untouched. */
+  function clearInstanceRecoveryGate(instanceId) {
+    if (!instanceId) return;
+    db.prepare('DELETE FROM recovery_gates WHERE scope = ?').run(String(instanceId));
+  }
+
+  /** True when a gate applies to the caller: legacy global, or this instance. */
+  function recoveryGateApplies(instanceId) {
+    const legacy = db.prepare("SELECT value FROM metadata WHERE key = 'recovery_gated'").get();
+    if (legacy && legacy.value === '1') return true;
+
+    if (!instanceId) {
+      // A legacy whole-service caller touches every account, so ANY unresolved
+      // instance gate must block it.
+      return Boolean(db.prepare('SELECT 1 AS hit FROM recovery_gates LIMIT 1').get());
+    }
+    return Boolean(db.prepare('SELECT 1 AS hit FROM recovery_gates WHERE scope = ?').get(String(instanceId)));
+  }
+
+  function assertIdle({ excludeActionId, excludeOperationId, allowParallelInstanceAction = null } = {}) {
+    /*
+     * Per-instance recovery isolation.
+     *
+     * This check used to be unconditionally global: a single account that ended
+     * NEEDS_ATTENTION set one metadata flag and every subsequent action of the whole
+     * service — including sibling accounts that were perfectly healthy — was refused
+     * with RECOVERY_GATED. Concurrent instances then degrade to serial-on-first-failure.
+     *
+     * The gate is now evaluated against the caller's own instance scope, so an
+     * unresolved failure in account A blocks A (and legacy whole-service work, which
+     * touches all accounts) but never B.
+     */
+    const scopeInstanceId = allowParallelInstanceAction ? String(allowParallelInstanceAction) : null;
+    if (recoveryGateApplies(scopeInstanceId)) {
+      const recovery = getRecoveryState();
       throw new StoreError(`Recovery gate is active: ${recovery.reason}`, 409, 'RECOVERY_GATED');
     }
 
@@ -392,13 +560,32 @@ export function openStore(options = {}) {
     const hasActionsTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='mcp_actions'").get();
     if (hasActionsTable) {
       let query = `
-        SELECT id, state FROM mcp_actions
+        SELECT id, state, instance_id FROM mcp_actions
         WHERE state NOT IN ('SUCCEEDED', 'REJECTED')
       `;
       const params = [];
       if (excludeActionId) {
         query += ' AND id != ?';
         params.push(excludeActionId);
+      }
+      /*
+       * Contract §2.3: "A pending action for instance A must NOT block instance B."
+       *
+       * Concurrent instances are the entire point of this feature, so the global
+       * one-action-at-a-time rule must not apply between DIFFERENT instances. Actions
+       * still execute serialized (the runner holds an exclusive lock), but they must be
+       * allowed to QUEUE in parallel. Only these still conflict:
+       *   - a legacy whole-service action (instance_id IS NULL)  -> conflicts with all
+       *   - another action for the SAME instance                 -> conflicts (busy)
+       * The filter is applied in SQL so the "first conflicting row" is chosen correctly.
+       */
+      if (allowParallelInstanceAction) {
+        const target = String(allowParallelInstanceAction);
+        const parsed = parseInstanceId(target);
+        if (parsed) {
+          query += ' AND (instance_id IS NULL OR instance_id = ?)';
+          params.push(target);
+        }
       }
       query += " ORDER BY CASE WHEN state = 'NEEDS_ATTENTION' THEN 0 ELSE 1 END ASC LIMIT 1";
       const activeAction = db.prepare(query).get(...params);
@@ -435,7 +622,9 @@ export function openStore(options = {}) {
     operationId: 'operation_id',
     reasonCode: 'reason_code',
     lastExitCode: 'last_exit_code',
-    observedAt: 'observed_at'
+    observedAt: 'observed_at',
+    owned: 'owned',
+    identityVerified: 'identity_verified'
   };
 
   function positivePidOrNull(value) {
@@ -498,6 +687,14 @@ export function openStore(options = {}) {
       reasonCode: row.reason_code ?? null,
       lastExitCode: Number.isInteger(row.last_exit_code) ? row.last_exit_code : null,
       observedAt: row.observed_at ?? null,
+      // Persisted ownership evidence (see upsertInstanceRuntime). `null` means
+      // "no evidence", which the UI treats as not-owned — never optimistically true.
+      owned: row.owned === 1,
+      // `managed` mirrors ownership: a process we recorded and verified is one we
+      // manage. Without this the /api/mcps projection reported managed=false for
+      // perfectly owned instances, so the UI said "运行中(未接管)".
+      managed: row.owned === 1,
+      identityVerified: row.identity_verified === 1,
       createdAt: row.created_at ?? null,
       updatedAt: row.updated_at ?? null,
       maskedTunnelId: serviceMeta ? (serviceMeta.maskedTunnelId ?? null) : null
@@ -617,6 +814,13 @@ export function openStore(options = {}) {
       if (key === 'lastExitCode') return Number.isInteger(rawValue) ? rawValue : null;
       if (key === 'startedAt' || key === 'observedAt') return isoOrNull(rawValue);
       if (key === 'state') return (typeof rawValue === 'string' && rawValue) ? rawValue : 'stopped';
+      // Ownership evidence is tri-state: 1 (affirmative), 0 (explicitly denied),
+      // null (unknown — never assume ownership).
+      if (key === 'owned' || key === 'identityVerified') {
+        if (rawValue === true || rawValue === 1) return 1;
+        if (rawValue === false || rawValue === 0) return 0;
+        return null;
+      }
       if (rawValue === null || rawValue === undefined) return null;
       return String(rawValue);
     };
@@ -676,7 +880,8 @@ export function openStore(options = {}) {
       UPDATE instance_runtime
       SET state = 'stopped', pid = NULL, started_at = NULL, executable_path = NULL,
           health_url = NULL, local_port = NULL, operation_id = NULL,
-          reason_code = 'process_stopped', observed_at = ?, updated_at = ?
+          reason_code = 'process_stopped', owned = 0, identity_verified = 0,
+          observed_at = ?, updated_at = ?
       WHERE instance_id = ?
     `).run(now, now, instanceId);
     return getInstanceRuntime(instanceId);
@@ -686,11 +891,27 @@ export function openStore(options = {}) {
   function listRunningInstanceProfileIds(serviceId) {
     if (typeof serviceId !== 'string' || !serviceId) return [];
     const rows = db.prepare(`
-      SELECT profile_id FROM instance_runtime
+      SELECT profile_id, pid FROM instance_runtime
       WHERE service_id = ? AND state = 'running' AND pid IS NOT NULL
       ORDER BY profile_id ASC
     `).all(serviceId);
-    return rows.map(row => row.profile_id).filter(id => typeof id === 'string' && id);
+    /*
+     * `pid IS NOT NULL` is a claim, not a running process. Phantom rows used to
+     * count against the per-service instance cap, so a machine that had crashed
+     * out of eight tunnels could refuse a real start with INSTANCE_LIMIT_REACHED
+     * while nothing was running. Only a live pid counts here; dead rows keep
+     * occupying nothing. Dedupe as before (one profile, one slot).
+     */
+    const alive = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const id = row.profile_id;
+      if (typeof id !== 'string' || !id || seen.has(id)) continue;
+      if (!isProcessAlive(Number(row.pid))) continue;
+      seen.add(id);
+      alive.push(id);
+    }
+    return alive;
   }
 
   /**
@@ -730,7 +951,8 @@ export function openStore(options = {}) {
       db.prepare("UPDATE metadata SET value = ? WHERE key = 'revision'").run(String(nextRev));
       return nextRev;
     },
-    assertIdle: ({ excludeActionId } = {}) => assertIdle({ excludeActionId }),
+    assertIdle: ({ excludeActionId, allowParallelInstanceAction } = {}) =>
+      assertIdle({ excludeActionId, allowParallelInstanceAction }),
     getServiceRuntime,
     clearActiveService: (serviceId) => {
       db.prepare('DELETE FROM active_profiles WHERE service_id = ?').run(serviceId);
@@ -1683,6 +1905,8 @@ export function openStore(options = {}) {
 
   return {
     getRevision,
+    getCodexBridgeEnabled,
+    setCodexBridgeEnabled,
     listProfiles,
     getProfile,
     createProfile,
@@ -1709,6 +1933,9 @@ export function openStore(options = {}) {
     loadAction,
     getRecoveryState,
     resetRecoveryGate,
+    clearRecoveryState,
+    setRecoveryGate,
+    clearInstanceRecoveryGate,
     listNeedsAttentionIds,
     acknowledgeRecoveryAction,
     assertIdle,

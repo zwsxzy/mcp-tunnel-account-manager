@@ -14,7 +14,10 @@ Repo: `D:\mcp-tunnel-account-manager` (only)
 2. NEVER read/write `%APPDATA%\tunnel-client\*.yaml` (production profiles).
 3. NEVER use `%LOCALAPPDATA%\McpTunnelAccountManager` (production data dir / `manager.db` / `master.key`).
    Dev/test/smoke use `%LOCALAPPDATA%\McpTunnelAccountManager-dev` or a temp dir.
-4. NEVER bind port `17642`. Dev console port is `17643`.
+4. NEVER bind port `17642`. NO fixed dev port is reserved: any port that is currently free may be
+   used, and it must be passed explicitly with `--port <n>` (see §7). `17643` is NOT safe by default —
+   on a machine with a second console deployed it is already occupied, which is exactly how the
+   original acceptance command failed.
 5. NEVER touch `D:\mcp`.
 6. Tests/demo use FAKE tunnel processes only (`tests/fixtures/fake-tunnel-health.mjs`), never the real
    `tunnel-client.exe`, and never scan for pre-existing `tunnel-client.exe`.
@@ -126,6 +129,25 @@ listRunningInstanceProfileIds(serviceId)   // -> string[]
 Returns the same shape as today, plus an optional additive `instances: [...]` array built from
 `listInstanceRuntimes`. When there are no instance rows → `instances: []`. Existing callers ignore it.
 
+### 2.5 Recovery gate is instance-scoped
+
+The recovery gate refuses new work while some earlier work needs a human. It MUST be per-instance,
+otherwise the first failing account paralyses every healthy sibling and the feature is pointless.
+
+Rules:
+- An action that ends `NEEDS_ATTENTION` and carries `instance_id` opens a gate scoped to
+  **that instance only** (table `recovery_gates`, `scope = instanceId`).
+- An action/operation with `instance_id IS NULL` (legacy whole-service work) opens the **global**
+  gate (`metadata.recovery_gated`), which blocks every instance — a legacy action touches all accounts.
+- `assertIdle()` consults the gate **for the caller's own scope**: a global gate blocks everyone;
+  an instance gate blocks only that instance; a legacy whole-service caller is blocked by any gate.
+- Acknowledging an instance action clears only its own gate.
+- `getRecoveryState()` keeps returning `{gated:false}` byte-identically when nothing is gated, and
+  adds an additive `instances: [{instanceId, reason}]` array when instance gates exist.
+
+This was NOT the behaviour before: the gate was one global flag checked before any instance
+filtering, so `NEEDS_ATTENTION` on account A refused `start` on account B with `RECOVERY_GATED`.
+
 ---
 
 ## 3. Adapter layer (owner: `adapter-instances`)
@@ -170,6 +192,13 @@ Registration: `src/adapters/index.mjs` gains
 `createInstanceAdapterProvider({dataDir, vault, definitions?, processController?, probe?, paths?})`
 returning `async (op, serviceId, profileId) => InstanceAdapter` with a cache keyed `instanceId`,
 plus `.release(instanceId)` / `.clear()`.
+
+**Production guard (`assertIsolatedInstanceDataDir`) must compare REAL paths.** A lexical
+`path.resolve()` comparison is bypassable three ways on Windows — an 8.3 short name
+(`MCPTUN~1`), a directory junction, and (historically) any subdirectory of the production data
+dir, because that branch lacked the descendant test its sibling branch had. The guard resolves
+candidate and root through `realResolve()` and requires `equal || descendant` for BOTH roots.
+`tests/instance-guard-isolation.test.mjs` pins all three classes plus the no-over-blocking control.
 
 **Backward compatibility:** `createAdapters()` / `createRegisteredAdapterProvider()` /
 `ServiceAdapter` must behave EXACTLY as today (all 44 unit test files depend on them).
@@ -250,13 +279,16 @@ New tests (fake processes only, temp dirs only):
   B is still `running`; assert no production paths touched.
 
 New script `scripts/smoke-concurrent-instances.mjs`:
-- starts the console on **17643** with `-DataDirectory`/`--data-dir` = isolated dev dir,
+- starts the console on the port given by `--port <n>` (defaults to 17643, which is only safe when
+  free — see §0.4) with `-DataDirectory`/`--data-dir` = isolated dev dir,
 - uses an isolated profile base (`%TEMP%\mcp-dev-profiles`),
 - drives two concurrent fake accounts for one service via the HTTP API,
 - prints a machine-readable summary `{port, dataDir, instances:[{instanceId,pid,state,localPort}], prodUntouched:true}`,
 - on exit stops ONLY its own children via the audited helper, and asserts
   production `17642` + pre-existing `tunnel-client.exe` PIDs are unchanged (compare a
   before/after snapshot of `(pid, CreationTimeFileTime)` taken at start/end).
+- refuses `--port 17642` outright, and rejects any non-integer / out-of-range value before it
+  touches the filesystem, so a typo cannot half-start the demo.
 
 ---
 
@@ -265,8 +297,21 @@ New script `scripts/smoke-concurrent-instances.mjs`:
 ```
 node scripts/check.mjs
 node scripts/run-tests.mjs --unit
-node scripts/smoke-concurrent-instances.mjs
+node scripts/smoke-concurrent-instances.mjs --port <a free port>
 ```
+
+`--port` is REQUIRED in practice. Pick any free port and confirm it first:
+
+```
+netstat -ano | findstr :<n>      # expect no output
+```
+
+Rules:
+- `17642` is refused by the script itself (production console).
+- **Any** port may already be occupied in this environment — `17643` is held by a second deployed
+  console on a machine that has one. Never assume 17643 is free; always probe before starting.
+- An occupied port fails fast at the bind probe with a clear error, so it is safe to retry with
+  another port; nothing is left half-started.
 
 All must pass with the production console on 17642 and existing tunnel-client processes
 (PIDs recorded at session start) still alive and unchanged.

@@ -20,6 +20,7 @@ import { assertStoppedConnectionReceipt } from './mcp-registry-policy.mjs';
 import { assertVerifiedReceipt } from './switch-core.mjs';
 import { verifyCarrierConfirmation } from './carrier-confirmation.mjs';
 import { missingReferenceDisposition } from './work-item-routing.mjs';
+import { isProcessAlive } from './process-liveness.mjs';
 import {
   decideInstanceAction,
   publicInstanceDTO,
@@ -333,7 +334,7 @@ function portFromHealthURL(healthURL) {
  * @param {object} [params.vault] - Vault for carrier confirmation tokens
  * @returns {Promise<object>} Public action DTO
  */
-export async function runInstanceLifecycleAction({ repo, adapterProvider, actionId, vault } = {}) {
+export async function runInstanceLifecycleAction({ repo, adapterProvider, actionId, vault, resourcePolicy = null } = {}) {
   if (!repo || typeof repo !== 'object') {
     throw new TypeError('A valid repo object is required to run instance lifecycle action');
   }
@@ -390,7 +391,33 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
     return await getPublicAction(repo, actionId);
   }
 
+  /*
+   * IDENTITY-ALIASING GUARD (proactive, before any effect).
+   *
+   * `sanitizeProfileSegment` caps the segment at 64 chars while discovery identities
+   * can be 71, so two genuinely DIFFERENT accounts can fold onto the same instanceId.
+   * The store refuses to rebind such a row, but `persistInstanceRuntime()` is
+   * best-effort and swallows that refusal. The visible symptom was worse than a
+   * missing write: the second account's start inspected the SHARED instanceId, saw
+   * the first account's verified process, concluded ALREADY_RUNNING, and reported
+   * SUCCEEDED while launching nothing — a silent false success for a tunnel that
+   * never existed.
+   *
+   * Refuse loudly instead: if the existing row for this instanceId belongs to a
+   * DIFFERENT raw profile id, the caller is addressing an account this id cannot
+   * represent. Nothing has mutated at this point, so this is a clean rejection.
+   */
+  {
+    const existing = await loadInstanceRuntimeRecord(repo, instanceId);
+    const storedProfileId = existing && existing.profileId != null ? String(existing.profileId) : null;
+    if (storedProfileId && storedProfileId !== profileId) {
+      await markRejected(repo, actionId, 'INVALID_INSTANCE');
+      return await getPublicAction(repo, actionId);
+    }
+  }
+
   let sideEffectsInitiated = false;
+  let admission = null;
   try {
     const opLike = {
       operationId: opId,
@@ -446,24 +473,35 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
 
     let inspectionSuccessful = !inspectError && inspected != null && typeof inspected === 'object';
 
-    // Degradation: no observation channel at all (store-only provider). Fall back
-    // to the persisted instance runtime record, which the lifecycle only writes
-    // after a VERIFIED effect.
+    // Degradation: no observation channel at all (store-only provider). The
+    // persisted record is a CLAIM, never an observation, so it may only CONFIRM a
+    // live process -- it must never invent one and never assert absence.
+    //
+    // The previous version trusted `state === 'running'` outright (a dead pid
+    // came back as an authoritative `running` observation) and turned
+    // `state === 'stopped'` into `running: false`, which the code below reads as
+    // `absenceVerified` -- the very proof that unlocks stop/restart without the
+    // carrier guard. Both directions are unsafe; an unusable channel now leaves
+    // the snapshot unverified.
     if (!inspectionSuccessful && !inspectError && !hasInspectionChannel) {
       const record = await loadInstanceRuntimeRecord(repo, instanceId);
-      if (record && typeof record === 'object') {
-        const observedAt = typeof record.observedAt === 'string' ? Date.parse(record.observedAt) : NaN;
-        const recordPid = positiveIntOrNull(record.pid);
-        if (record.state === 'running' && recordPid && Number.isFinite(observedAt)) {
+      const recordPid = positiveIntOrNull(record?.pid);
+      if (record && record.state === 'running' && recordPid && isProcessAlive(recordPid)
+          && typeof adapter.processController?.verify === 'function') {
+        let confirmed = false;
+        try {
+          const verdict = await adapter.processController.verify(record);
+          confirmed = verdict?.valid === true;
+        } catch (_) {
+          confirmed = false;
+        }
+        if (confirmed) {
           inspected = {
             running: true,
             pid: recordPid,
             startedAt: record.startedAt || null,
             executablePath: record.executablePath || null
           };
-          inspectionSuccessful = true;
-        } else if ((record.state === 'stopped' || record.state === 'failed') && Number.isFinite(observedAt)) {
-          inspected = { running: false };
           inspectionSuccessful = true;
         }
       }
@@ -482,7 +520,9 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
           identityVerified = false;
         }
       } else {
-        identityVerified = Boolean(inspected.startedAt && inspected.executablePath);
+        // No verifier: ownership of the pid is unproven, so the instance must not
+        // be treated as a verified `running` target.
+        identityVerified = false;
       }
     }
 
@@ -643,6 +683,10 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
           executablePath: snapshot.executablePath,
           operationId: null,
           reasonCode: 'process_verified_running',
+          // A noop start only happens for a live process whose recorded identity was
+          // just verified (decideInstanceAction requires owned+identityVerified).
+          owned: true,
+          identityVerified: true,
           observedAt: new Date().toISOString()
         });
       } else if (decision.code === 'ALREADY_STOPPED') {
@@ -655,8 +699,36 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
           executablePath: null,
           operationId: null,
           reasonCode: 'process_stopped',
+          owned: false,
+          identityVerified: false,
           observedAt: new Date().toISOString()
         });
+        // Mirror the service-level fix: decideInstanceAction only reaches
+        // ALREADY_STOPPED when the snapshot was a TERMINAL_ABSENT state carrying
+        // absenceVerified === true, i.e. absence was already proven. Publishing the
+        // proof here is what lets the same-tick removal/stop guards and the service
+        // observer agree that this instance is genuinely gone instead of keeping a
+        // stale `running` cache row alive.
+        const noopObs = typeof repo.getObserver === 'function'
+          ? repo.getObserver()
+          : (typeof repo.registry?.getObserver === 'function' ? repo.registry.getObserver() : null);
+        try {
+          if (noopObs && typeof noopObs.setTunnelClient === 'function') {
+            noopObs.setTunnelClient(instanceId, {
+              state: 'stopped',
+              managed: true,
+              pid: null,
+              startedAt: null,
+              profileId,
+              operationId: null,
+              observedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 90000).toISOString(),
+              reasonCode: 'process_stopped',
+              lastExitCode: null,
+              absenceVerified: true
+            });
+          }
+        } catch (_) {}
       }
       if (typeof repo.transitionAction === 'function') {
         await repo.transitionAction(actionId, { state: 'SUCCEEDED' });
@@ -667,6 +739,23 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
     }
 
     // --- decision === 'enqueue' => execute ---
+    //
+    // Shared admission before any effect: a restart must be refused BEFORE its
+    // old instance is stopped, and a start must be refused before config/intent
+    // is written. The reservation is released in the outer finally.
+    if ((actionKind === 'start' || actionKind === 'restart') && typeof resourcePolicy?.admitStart === 'function') {
+      try {
+        admission = await resourcePolicy.admitStart({
+          serviceId: action.serviceId,
+          carrier: controlCarrier === true,
+          kind: actionKind
+        });
+      } catch (admissionError) {
+        await markRejected(repo, actionId, admissionError?.code || 'RESOURCE_ADMISSION_FAILED');
+        return await getPublicAction(repo, actionId);
+      }
+    }
+
     if (typeof repo.transitionAction === 'function') {
       await repo.transitionAction(actionId, { state: 'APPLYING' });
     } else if (typeof repo.phase === 'function') {
@@ -714,7 +803,11 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
             observedAt: nowIso(),
             expiresAt: expiresIso(),
             reasonCode: 'process_stopped',
-            lastExitCode: null
+            lastExitCode: null,
+            // The receipt was asserted above (assertStoppedConnectionReceipt), so
+            // this is a proven absence. Without the flag the ALREADY_STOPPED guard
+            // and the removal guard had no production writer to consume.
+            absenceVerified: true
           });
         } catch (_) {}
       }
@@ -730,6 +823,8 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
         localPort: null,
         operationId: null,
         reasonCode: 'process_stopped',
+        owned: false,
+        identityVerified: false,
         observedAt: nowIso()
       });
 
@@ -806,6 +901,10 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
         obs.setTunnelClient(instanceId, {
           state: 'running',
           managed: true,
+          // Mirrors the persisted instance_runtime evidence so the HTTP overlay and
+          // the store agree about whether this process may be stopped/restarted.
+          owned: true,
+          identityVerified: true,
           pid: observedPid,
           startedAt: observedStartedAt || nowIso(),
           profileId,
@@ -813,7 +912,9 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
           observedAt: nowIso(),
           expiresAt: expiresIso(),
           reasonCode: 'process_verified_running',
-          lastExitCode: null
+          lastExitCode: null,
+          // A verified-running client is the opposite of absence.
+          absenceVerified: false
         });
       } catch (_) {}
     }
@@ -834,6 +935,11 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
       profileYamlPath: typeof adapter.configPath === 'string' ? adapter.configPath : null,
       operationId: opId,
       reasonCode: 'process_verified_running',
+      // We launched this process and its receipt passed assertVerifiedReceipt above,
+      // so ownership and identity are established facts, not guesses. Persisting them
+      // is what lets the UI offer stop/restart for this row.
+      owned: true,
+      identityVerified: true,
       observedAt: nowIso()
     });
 
@@ -864,6 +970,10 @@ export async function runInstanceLifecycleAction({ repo, adapterProvider, action
       await markAttention(repo, actionId, code);
     }
     return await getPublicAction(repo, actionId);
+  } finally {
+    if (admission && typeof resourcePolicy?.release === 'function') {
+      try { resourcePolicy.release(admission); } catch (_) {}
+    }
   }
 }
 

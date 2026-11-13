@@ -100,6 +100,10 @@ export const appState = {
   mcpLocations: new Map(),
   discoveryCandidates: [],
   activeTab: 'accounts', // 'accounts' | 'mcps'
+  // Client-side pagination for the two list views.
+  page: { profiles: 1, mcps: 1 },
+  pageSize: { profiles: 6, mcps: 3 },
+  selectedProfileIds: [], // multi-select of 待激活配置文件
   currentOperation: null,
   operationPollingTimer: null,
   lifecycleStopTimer: null,
@@ -467,9 +471,19 @@ export function initDomReferences() {
 
   // Switch Control
   dom.switchTargetsContainer = document.getElementById('switch-targets-container');
-  dom.switchProfileSelect = document.getElementById('switch-profile-select');
+  dom.switchProfilesList = document.getElementById('switch-profiles-list');
   dom.switchSelectedProfileInfo = document.getElementById('switch-selected-profile-info');
   dom.btnExecuteSwitch = document.getElementById('btn-execute-switch');
+  dom.btnParallelStart = document.getElementById('btn-parallel-start');
+  dom.btnStopAllTunnelClients = document.getElementById('btn-stop-all-tunnel-clients');
+  dom.profilesPager = document.getElementById('profiles-pager');
+  dom.mcpsPager = document.getElementById('mcps-pager');
+  dom.stopAllProgress = document.getElementById('stop-all-progress');
+  dom.stopAllProgressFill = document.getElementById('stop-all-progress-fill');
+  dom.stopAllProgressText = document.getElementById('stop-all-progress-text');
+  dom.parallelProgress = document.getElementById('parallel-progress');
+  dom.parallelProgressFill = document.getElementById('parallel-progress-fill');
+  dom.parallelProgressText = document.getElementById('parallel-progress-text');
 
   // Operation Progress Card
   dom.operationProgressCard = document.getElementById('operation-progress-card');
@@ -497,6 +511,11 @@ export function initDomReferences() {
   dom.btnModalDeleteProfile = document.getElementById('btn-modal-delete-profile');
   dom.btnModalCancel = document.getElementById('btn-modal-cancel');
   dom.btnModalSave = document.getElementById('btn-modal-save');
+
+  // Codex 桥接开关
+  dom.codexBridgeToggle = document.getElementById('codex-bridge-toggle');
+  dom.codexBridgeLabel = document.getElementById('codex-bridge-label');
+  dom.codexBridgeHint = document.getElementById('codex-bridge-hint');
 
   // MCP Services Section
   dom.btnScanDiscovery = document.getElementById('btn-scan-discovery');
@@ -924,7 +943,37 @@ export async function handleLogout() {
 // Dashboard Data & Multi-MCP Registry Loading
 // ==========================================================================
 
+let dashboardLoadInFlight = null;
+let dashboardLoadQueued = false;
+
+/**
+ * Coalesced dashboard load.
+ *
+ * `loadDashboardData()` is called by the operation/instance/tunnel pollers AND by
+ * every mutation completion handler. A slow `/api/state` + `/api/mcps` pair used
+ * to stack: every completion started another parallel fetch. Callers now share
+ * one in-flight load, and a request that arrives while it runs marks one trailing
+ * reload so a mutation completed mid-flight still triggers exactly one update.
+ */
 export async function loadDashboardData() {
+  if (dashboardLoadInFlight) {
+    dashboardLoadQueued = true;
+    return dashboardLoadInFlight;
+  }
+  dashboardLoadInFlight = (async () => {
+    try {
+      do {
+        dashboardLoadQueued = false;
+        await loadDashboardDataOnce();
+      } while (dashboardLoadQueued);
+    } finally {
+      dashboardLoadInFlight = null;
+    }
+  })();
+  return dashboardLoadInFlight;
+}
+
+async function loadDashboardDataOnce() {
   try {
     const [stateData, profilesData, mcpsData] = await Promise.all([
       apiRequest('/api/state').catch(() => null),
@@ -1013,6 +1062,7 @@ export async function loadDashboardData() {
     renderProfilesGrid();
     renderSwitchProfileDropdown();
     renderMcpsRegistryGrid();
+    await loadCodexBridgeSetting();
   } catch (err) {
     console.error('Failed to load dashboard:', err);
     const parsed = formatSafeError(err);
@@ -1061,44 +1111,66 @@ export function renderSwitchTargets() {
   });
 }
 
+/** Reads the multi-selected account ids from the checkbox list. */
+export function getSelectedProfileIds() {
+  if (!dom.switchProfilesList) return [];
+  const boxes = dom.switchProfilesList.querySelectorAll('input[type="checkbox"]:checked') || [];
+  const ids = Array.from(boxes).map(b => b.value).filter(Boolean);
+  appState.selectedProfileIds = ids;
+  return ids;
+}
+
 export function renderSwitchProfileDropdown() {
-  if (!dom.switchProfileSelect) return;
-  const currentSelected = dom.switchProfileSelect.value;
-  dom.switchProfileSelect.innerHTML = '<option value="">-- 请选择要切换的目标配置 --</option>';
+  const previouslySelected = new Set(
+    (appState.selectedProfileIds && appState.selectedProfileIds.length
+      ? appState.selectedProfileIds
+      : getSelectedProfileIds())
+  );
 
-  appState.profiles.forEach(profile => {
-    const isActive = isProfileActive(profile.id) || profile.isActive === true;
-    const option = document.createElement('option');
-    option.value = profile.id;
-    option.textContent = `${profile.label || '未命名'} ${isActive ? '(当前生效)' : ''}`;
-    dom.switchProfileSelect.appendChild(option);
-  });
-
-  if (currentSelected && appState.profiles.some(p => p.id === currentSelected)) {
-    dom.switchProfileSelect.value = currentSelected;
+  // Primary control: a checkbox list — one click per account, unambiguous multi-select.
+  if (dom.switchProfilesList) {
+    if (!appState.profiles.length) {
+      dom.switchProfilesList.innerHTML = '<div class="loading-placeholder-sm">暂无配置文件</div>';
+      updateSelectedProfilePreview();
+      return;
+    }
+    dom.switchProfilesList.innerHTML = appState.profiles.map(profile => {
+      const isActive = isProfileActive(profile.id) || profile.isActive === true;
+      const checked = previouslySelected.has(profile.id) ? 'checked' : '';
+      const svcCount = Object.keys(profile.services || {}).length;
+      return `<label class="account-option${checked ? ' account-option-selected' : ''}">
+        <input type="checkbox" value="${escapeHtml(profile.id)}" ${checked}>
+        <span class="account-option-name">${escapeHtml(profile.label || '未命名')}</span>
+        <span class="account-option-meta">${svcCount} 个服务</span>
+        ${isActive ? '<span class="account-option-badge">当前生效</span>' : ''}
+      </label>`;
+    }).join('');
   }
+
   updateSelectedProfilePreview();
+  refreshScrollAffordances();
 }
 
 export function updateSelectedProfilePreview() {
   if (!dom.switchSelectedProfileInfo) return;
-  const selectedId = dom.switchProfileSelect.value;
-  if (!selectedId) {
+  const selectedIds = getSelectedProfileIds();
+  if (selectedIds.length === 0) {
     dom.switchSelectedProfileInfo.textContent = '';
     return;
   }
-  const profile = appState.profiles.find(p => p.id === selectedId);
-  if (!profile) return;
+  const profiles = selectedIds
+    .map(id => appState.profiles.find(p => p.id === id))
+    .filter(Boolean);
 
-  const servicesInfo = appState.mcps.map(mcp => {
-    const svc = profile.services?.[mcp.id] || {};
-    const hasTid = Boolean(svc.tunnelId || svc.maskedTunnelId);
-    return `${escapeHtml(mcp.label || mcp.id)}: ${hasTid ? maskTunnelId(svc.tunnelId || svc.maskedTunnelId) : '未配置'}`;
-  }).join(' | ');
+  const chips = profiles
+    .map(profile => `<span class="selected-chip">${escapeHtml(profile.label || '未命名')}</span>`)
+    .join('');
 
   dom.switchSelectedProfileInfo.innerHTML = `
-    目标概要: <strong>${escapeHtml(profile.label)}</strong> (Rev: ${profile.revision ?? '-'})
-    <div style="margin-top:2px; font-size:11px; color:var(--text-muted);">${servicesInfo || '无已配置服务'}</div>
+    <div class="selected-summary">
+      <span class="selected-summary-count">已选 ${selectedIds.length} 个账号</span>
+      <span class="selected-chips">${chips}</span>
+    </div>
   `;
 }
 
@@ -1114,7 +1186,8 @@ export async function handleExecuteSwitch() {
     return;
   }
 
-  const selectedProfileId = dom.switchProfileSelect?.value;
+  // Legacy single-profile hot-switch: use the first selected account.
+  const selectedProfileId = getSelectedProfileIds()[0] || null;
   if (!selectedProfileId) {
     showAlert('warning', '校验提示', '[VALIDATION_ERROR] 请选择要切换的目标配置文件。');
     return;
@@ -1184,12 +1257,242 @@ export async function handleExecuteSwitch() {
   }
 }
 
+/**
+ * "并行启动所选账号": for every selected account and every checked target
+ * service, start that account's tunnel instance (POST .../instances/<pid>/start).
+ * Reuses the proven instance API so each account runs an independent process.
+ */
+/**
+ * Waits until one instance reaches a terminal state after an action.
+ *
+ * The action is QUEUED asynchronously, so the instance still reads `stopped`
+ * for the first seconds after a start request. Treating that as "finished"
+ * produced false "启动后状态为 stopped" failures. So:
+ *   - `running` / `failed` are terminal immediately;
+ *   - `stopped` only counts after we have seen a transition, or after a grace
+ *     period long enough for the queued action to actually be applied.
+ */
+/**
+ * Polls the backend until the given MCP action reaches a terminal state.
+ * This is the authoritative signal — no guessing from instance rows.
+ */
+async function waitActionTerminal(actionId, timeoutMs = 120000) {
+  const began = Date.now();
+  while (Date.now() - began < timeoutMs) {
+    try {
+      const action = await apiRequest(`/api/mcp-actions/${encodeURIComponent(actionId)}`);
+      if (action?.terminal) return action;
+    } catch (_) { /* keep polling */ }
+    await new Promise(res => setTimeout(res, 800));
+  }
+  return null;
+}
+
+export async function handleParallelStartSelected() {
+  const selectedProfileIds = getSelectedProfileIds();
+  if (selectedProfileIds.length === 0) {
+    showAlert('warning', '校验提示', '请至少勾选一个账号配置。');
+    return;
+  }
+  const selectedServices = [];
+  const checkboxes = dom.switchTargetsContainer?.querySelectorAll('input[type="checkbox"]:checked') || [];
+  checkboxes.forEach(cb => { if (cb.value) selectedServices.push(cb.value); });
+  if (selectedServices.length === 0) {
+    showAlert('warning', '校验提示', '请至少勾选一个目标 MCP 服务。');
+    return;
+  }
+
+  // Build the job list, skipping only pairs without credentials.
+  //
+  // Never pre-skip a pair because the cached instance row says "running": that row
+  // can outlive its process (crash, externally killed client, or a session that was
+  // never stopped cleanly), and a client-side skip then reports "已在运行" for an
+  // instance that is not running at all — without ever asking the backend, so the
+  // stale row never gets reconciled. The backend is authoritative: it checks that
+  // the recorded pid is actually alive and answers noop/ALREADY_RUNNING for a
+  // genuinely running instance (src/http/instance-routes.mjs), which this function
+  // already maps back to the same "已在运行" skip below. Always send the request.
+  const jobs = [];
+  for (const pid of selectedProfileIds) {
+    for (const sid of selectedServices) {
+      const mcp = appState.mcps.find(m => m.id === sid);
+      const profile = appState.profiles.find(p => p.id === pid);
+      const svc = profile?.services?.[sid] || {};
+      const label = `${profile?.label || pid.slice(0, 8)}@${mcp?.label || sid}`;
+      if (!mcp) { jobs.push({ sid, pid, label, skip: '服务不存在' }); continue; }
+      if (!svc.tunnelId && !svc.maskedTunnelId && !svc.hasApiKey && !svc.apiKey) {
+        jobs.push({ sid, pid, label, skip: '该账号未配置此服务凭证' });
+        continue;
+      }
+      jobs.push({ sid, pid, label });
+    }
+  }
+
+  if (dom.btnParallelStart) dom.btnParallelStart.disabled = true;
+  const ok = [];
+  const skipped = [];
+  const failed = [];
+  const total = jobs.length;
+
+  const runJob = async (job) => {
+    if (job.skip) return { kind: 'skip', text: `${job.label}：${job.skip}` };
+    let response = null;
+    try {
+      // NOTE: deliberately NO expectedRevision. Instance actions are scoped to one
+      // instance, and every completed action bumps the global revision — reusing a
+      // cached value made every subsequent job fail with REVISION_CONFLICT.
+      response = await apiRequest(
+        `/api/mcps/${encodeURIComponent(job.sid)}/instances/${encodeURIComponent(job.pid)}/start`,
+        { method: 'POST', headers: { 'Idempotency-Key': generateIdempotencyKey() }, body: { profileId: job.pid } }
+      );
+    } catch (err) {
+      return { kind: 'fail', text: `${job.label}：${formatSafeError(err).displayText}` };
+    }
+
+    // The backend answers a noop directly (already running) — nothing to wait for.
+    const decision = response?.decision || response?.code;
+    if (decision === 'noop' || response?.code === 'ALREADY_RUNNING') {
+      return { kind: 'skip', text: `${job.label}：已在运行` };
+    }
+
+    // Authoritative: poll the ACTION record until it is terminal.
+    const actionId = response?.operationId || response?.id || null;
+    if (!actionId) return { kind: 'fail', text: `${job.label}：后端未返回动作 ID` };
+    const finalAction = await waitActionTerminal(actionId);
+    if (!finalAction) return { kind: 'fail', text: `${job.label}：等待动作完成超时` };
+    if (finalAction.state !== 'SUCCEEDED') {
+      return { kind: 'fail', text: `${job.label}：${finalAction.errorCode || finalAction.state}` };
+    }
+
+    let row = null;
+    try {
+      const rows = await fetchMcpInstances(job.sid);
+      row = rows.find(r => String(r?.profileId) === String(job.pid)) || null;
+    } catch (_) { /* ignore */ }
+    return { kind: 'ok', text: row?.pid ? `${job.label}（PID ${row.pid}）` : job.label };
+  };
+
+  try {
+    setParallelProgress(0, `共 ${total} 个启动任务，准备中…`);
+    for (let i = 0; i < total; i += 1) {
+      const job = jobs[i];
+      setParallelProgress(Math.round((i / total) * 100), `正在启动 ${job.label}（${i + 1}/${total}）…`);
+      const outcome = await runJob(job);
+      if (outcome.kind === 'ok') ok.push(outcome.text);
+      else if (outcome.kind === 'skip') skipped.push(outcome.text);
+      else failed.push(outcome.text);
+      setParallelProgress(
+        Math.round(((i + 1) / total) * 100),
+        `已处理 ${i + 1}/${total} — 成功 ${ok.length}，失败 ${failed.length}，跳过 ${skipped.length}`
+      );
+      try { renderMcpsRegistryGrid(); } catch (_) {}
+    }
+  } finally {
+    if (dom.btnParallelStart) dom.btnParallelStart.disabled = false;
+    hideParallelProgress();
+  }
+
+  const lines = [`成功 ${ok.length} 个，失败 ${failed.length} 个，跳过 ${skipped.length} 个。`];
+  if (ok.length) lines.push(`成功：${ok.join('；')}`);
+  if (failed.length) lines.push(`失败：${failed.join('；')}`);
+  if (skipped.length) lines.push(`跳过：${skipped.join('；')}`);
+  showAlert(failed.length ? 'warning' : 'success', '并行启动结果', lines.join(' '));
+  try { await loadDashboardData(); } catch (_) {}
+}
+
+/**
+ * "一键关闭所有 tunnel-client": calls the guard-protected stop-all endpoint,
+ * which marks every known instance stopped and force-terminates all
+ * tunnel-client.exe on this host.
+ */
+/* Progress helpers for the "close all tunnel-client" action. */
+function setProgressBar(panel, fill, label, pct, text) {
+  const value = Math.max(0, Math.min(100, Math.round(pct)));
+  if (panel) {
+    panel.classList.remove('hidden');
+    panel.setAttribute('aria-valuenow', String(value));
+  }
+  if (fill) {
+    fill.classList.toggle('is-done', value >= 100);
+    fill.style.width = `${value}%`;
+  }
+  if (text && label) label.textContent = text;
+}
+
+function setStopAllProgress(pct, text) {
+  setProgressBar(dom.stopAllProgress, dom.stopAllProgressFill, dom.stopAllProgressText, pct, text);
+}
+
+function hideStopAllProgress(delayMs = 2500) {
+  setTimeout(() => dom.stopAllProgress?.classList.add('hidden'), delayMs);
+}
+
+function setParallelProgress(pct, text) {
+  setProgressBar(dom.parallelProgress, dom.parallelProgressFill, dom.parallelProgressText, pct, text);
+}
+
+function hideParallelProgress(delayMs = 4000) {
+  setTimeout(() => dom.parallelProgress?.classList.add('hidden'), delayMs);
+}
+
+export async function handleStopAllTunnelClients() {
+  if (!window.confirm('确定要强制关闭本机所有 tunnel-client 进程吗？这会中断所有正在运行的隧道。')) return;
+  if (dom.btnStopAllTunnelClients) dom.btnStopAllTunnelClients.disabled = true;
+  setStopAllProgress(2, '已提交关闭任务…');
+
+  const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+  try {
+    // 1) Backend starts a real job.
+    const started = await apiRequest('/api/tunnel-clients/stop-all', { method: 'POST', body: {} });
+    const jobId = started?.jobId;
+    if (!jobId) throw new Error('后端未返回任务 ID');
+
+    // 2) Poll the job: the progress bar shows the backend's real percentage.
+    let snapshot = null;
+    const began = Date.now();
+    while (Date.now() - began < 120000) {
+      snapshot = await apiRequest(`/api/tunnel-clients/stop-all/jobs/${encodeURIComponent(jobId)}`);
+      const pct = Number.isFinite(snapshot?.percent) ? snapshot.percent : 0;
+      setStopAllProgress(pct, `${snapshot?.message || '处理中…'}（${Math.round(pct)}%）`);
+      if (snapshot?.done) break;
+      await sleep(300);
+    }
+
+    if (!snapshot?.done) {
+      showAlert('warning', '关闭任务超时', '已超出等待时间，请稍后刷新页面确认 tunnel-client 状态。');
+    } else if (Number(snapshot.remaining) > 0) {
+      const pids = Array.isArray(snapshot.remainingPids) ? snapshot.remainingPids.join(', ') : '';
+      showAlert('warning', '仍有 tunnel-client 未关闭',
+        `已终止 ${snapshot.killed || 0} 个进程（标记 ${snapshot.markedStopped || 0} 条账号隧道停止），但仍有 ${snapshot.remaining} 个存活${pids ? `（PID: ${pids}）` : ''}，请重试。`);
+    } else {
+      const clearedActive = Number(snapshot.clearedActions) || 0;
+      const clearedOps = Number(snapshot.clearedOperations) || 0;
+      const gateText = `恢复闸门已复位${clearedActive + clearedOps > 0
+        ? `（清理 ${clearedActive} 条待处理动作${clearedOps ? `、${clearedOps} 条异常操作` : ''}）`
+        : ''}`;
+      showAlert('success', '已关闭所有 tunnel-client',
+        `已终止 ${snapshot.killed || 0} 个 tunnel-client 进程，将 ${snapshot.markedStopped || 0} 条账号隧道标记为停止；${gateText}，复查确认当前已无 tunnel-client 进程。`);
+    }
+    try { await loadDashboardData(); } catch (_) {}
+  } catch (err) {
+    setStopAllProgress(0, '关闭失败');
+    const parsed = formatSafeError(err);
+    showAlert('error', '关闭失败', parsed.displayText);
+  } finally {
+    if (dom.btnStopAllTunnelClients) dom.btnStopAllTunnelClients.disabled = false;
+    hideStopAllProgress();
+  }
+}
+
 export function startOperationPolling(operationId, idempotencyKey) {
   if (appState.operationPollingTimer) {
     clearInterval(appState.operationPollingTimer);
   }
 
+  let pollInFlight = false;
   const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const op = await apiRequest(`/api/operations/${encodeURIComponent(operationId)}`);
       op.idempotencyKey = idempotencyKey;
@@ -1218,6 +1521,8 @@ export function startOperationPolling(operationId, idempotencyKey) {
       }
     } catch (pollErr) {
       console.warn('Operation polling warning:', pollErr);
+    } finally {
+      pollInFlight = false;
     }
   };
 
@@ -1291,6 +1596,106 @@ export function updateProgressView(op) {
 // Account Profiles View
 // ==========================================================================
 
+
+/**
+ * Renders one pager bar (info + prev/next + page numbers) for a list view.
+ * Purely client-side: the list arrays are already in memory.
+ */
+export function renderPager(kind, totalItems, currentPage, pageSize, onChange) {
+  const el = kind === 'profiles' ? dom.profilesPager : dom.mcpsPager;
+  if (!el) return;
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const page = Math.min(Math.max(1, currentPage), totalPages);
+
+  // Always visible, including the single-page case.
+  el.classList.remove('hidden');
+
+  const btn = (label, target, { disabled = false, active = false, title = '' } = {}) =>
+    `<button type="button" class="pager-btn${active ? ' pager-btn-active' : ''}"
+            data-page="${target}"${disabled ? ' disabled' : ''}${title ? ` title="${title}"` : ''}>${label}</button>`;
+
+  // Compact numeric window: first / last page, ellipsis for the hidden middle.
+  const windowSize = 7;
+  let from = Math.max(1, page - Math.floor(windowSize / 2));
+  let to = Math.min(totalPages, from + windowSize - 1);
+  from = Math.max(1, to - windowSize + 1);
+
+  const numbers = [];
+  if (from > 1) {
+    numbers.push(btn('1', 1, { active: page === 1 }));
+    if (from > 2) numbers.push('<span class="pager-ellipsis" aria-hidden="true">…</span>');
+  }
+  for (let i = from; i <= to; i += 1) numbers.push(btn(String(i), i, { active: i === page }));
+  if (to < totalPages) {
+    if (to < totalPages - 1) numbers.push('<span class="pager-ellipsis" aria-hidden="true">…</span>');
+    numbers.push(btn(String(totalPages), totalPages, { active: page === totalPages }));
+  }
+
+  // Direct page picker: type a number (or use the dropdown) to jump anywhere,
+  // even when the page list is truncated by the window above.
+  const options = Array.from({ length: totalPages }, (_, i) =>
+    `<option value="${i + 1}"${i + 1 === page ? ' selected' : ''}>第 ${i + 1} 页</option>`
+  ).join('');
+
+  el.innerHTML = `
+    <span class="pager-info">共 ${totalItems} 项 · 第 ${page} / ${totalPages} 页</span>
+    <div class="pager-controls">
+      ${btn('‹ 上一页', page - 1, { disabled: page <= 1, title: '上一页' })}
+      ${numbers.join('')}
+      ${btn('下一页 ›', page + 1, { disabled: page >= totalPages, title: '下一页' })}
+      <label class="pager-jump" title="跳转到指定页码">
+        跳至
+        <select class="pager-jump-select" data-pager-jump="${kind}" aria-label="选择页码">${options}</select>
+        页
+      </label>
+    </div>
+  `;
+
+  el.querySelectorAll('[data-page]').forEach(b => {
+    b.addEventListener('click', () => {
+      const target = Number(b.dataset.page);
+      if (!Number.isSafeInteger(target) || target < 1 || target > totalPages || target === page) return;
+      onChange(target);
+    });
+  });
+
+  const jumpEl = el.querySelector('[data-pager-jump]');
+  if (jumpEl) {
+    jumpEl.addEventListener('change', () => {
+      const target = Number(jumpEl.value);
+      if (!Number.isSafeInteger(target) || target < 1 || target > totalPages || target === page) return;
+      onChange(target);
+    });
+  }
+}
+
+/** Slices one page out of a list and clamps the stored page number. */
+function pageSlice(kind, list) {
+  const size = appState.pageSize[kind] || 6;
+  const totalPages = Math.max(1, Math.ceil(list.length / size));
+  if (!appState.page[kind] || appState.page[kind] > totalPages) appState.page[kind] = totalPages;
+  if (appState.page[kind] < 1) appState.page[kind] = 1;
+  const start = (appState.page[kind] - 1) * size;
+  return { items: list.slice(start, start + size), total: list.length, size, page: appState.page[kind] };
+}
+
+/** Toggles the bottom fade hint on a scrollable element. */
+export function updateScrollAffordance(el) {
+  if (!el || !el.classList) return;
+  const overflows = el.scrollHeight - el.clientHeight > 4;
+  el.classList.toggle('has-overflow', overflows);
+}
+
+/**
+ * Attaches the scroll fade to every scrollable region currently in the DOM.
+ * Called after each render of the lists that can overflow.
+ */
+export function refreshScrollAffordances() {
+  if (typeof document === 'undefined') return;
+  const nodes = document.querySelectorAll('#mcps-container, .instance-list.scroll-fade, #switch-profiles-list');
+  nodes.forEach(node => updateScrollAffordance(node));
+}
+
 export function renderProfilesGrid() {
   if (!dom.profilesContainer) return;
   dom.profilesContainer.innerHTML = '';
@@ -1301,10 +1706,12 @@ export function renderProfilesGrid() {
         <p>暂无任何配置文件。点击上方“添加新配置”开始创建。</p>
       </div>
     `;
+    if (dom.profilesPager) { dom.profilesPager.innerHTML = ''; dom.profilesPager.classList.add('hidden'); }
     return;
   }
 
-  appState.profiles.forEach(profile => {
+  const profilesPage = pageSlice('profiles', appState.profiles);
+  profilesPage.items.forEach(profile => {
     const isActive = isProfileActive(profile.id) || profile.isActive === true || profile.active === true;
     const card = document.createElement('div');
     card.className = `profile-card ${isActive ? 'active-profile' : ''}`;
@@ -1380,8 +1787,15 @@ export function renderProfilesGrid() {
       btnDelete.addEventListener('click', () => handleDeleteProfile(profile.id, profile.label));
     }
 
+
     dom.profilesContainer.appendChild(card);
   });
+
+  renderPager('profiles', profilesPage.total, profilesPage.page, profilesPage.size, (target) => {
+    appState.page.profiles = target;
+    renderProfilesGrid();
+  });
+  refreshScrollAffordances();
 }
 
 export function openCreateProfileModal() {
@@ -1710,6 +2124,11 @@ export const TUNNEL_CLIENT_REASON_LABELS = {
   external_process_unmanaged: '外部运行（未接管）',
   external_http_unmanaged: '外部 HTTP 服务（未配置本地隧道客户端）',
   process_not_running: '进程未运行',
+  // Raised by the publication layer when a persisted `running` row outlived its
+  // process (console crash / externally killed client). Without these labels the
+  // raw code leaked straight into the card title (LABELS[code] || code).
+  process_not_found: '进程已不存在',
+  observation_expired: '观测已过期',
   process_exited: '进程已退出',
   process_spawn_failed: '进程启动失败',
   process_identity_mismatch: '进程标识不匹配',
@@ -1824,6 +2243,50 @@ export function formatTunnelClientBadge(tunnelClient) {
   return `<span class="${badgeClass}"${titleAttr}>${escapeHtml(label)}</span>`;
 }
 
+/**
+ * Aggregate summary of a service's tunnel-client processes.
+ *
+ * The legacy `runtime.tunnelClient` field describes only ONE process, so showing
+ * it for a multi-account service claims "PID x / account y" while a second tunnel
+ * exists. When instance rows are present they are the source of truth.
+ */
+export function describeTunnelClients(mcp) {
+  const instances = getMcpInstances(mcp);
+  if (!instances.length) return null;
+  const running = instances.filter(i => i.state === 'running');
+
+  if (instances.length === 1) {
+    const only = instances[0];
+    if (only.state === 'running' && only.pid) {
+      let desc = `隧道客户端进程正常运行 (PID: ${only.pid})`;
+      if (only.profileLabel) desc += `，运行账号: ${only.profileLabel}`;
+      if (only.startedAt) desc += `，启动于: ${formatShortLocalTime(only.startedAt)}`;
+      return desc;
+    }
+    return formatProcessHeadline(only).text;
+  }
+
+  const detail = instances.map(i => {
+    const tag = i.profileLabel || String(i.profileId || '').slice(0, 8) || '未知账号';
+    if (i.state === 'running' && i.pid) return `${tag}(PID ${i.pid})`;
+    return `${tag}(${formatProcessHeadline(i).text.replace('隧道客户端进程', '') || '已停止'})`;
+  }).join('、');
+  return `共 ${instances.length} 个隧道客户端进程，运行中 ${running.length} 个：${detail}`;
+}
+
+/** Badge text that matches the aggregated tunnel-client state. */
+export function tunnelClientsBadge(mcp) {
+  const instances = getMcpInstances(mcp);
+  if (!instances.length) return null;
+  const running = instances.filter(i => i.state === 'running');
+  const failed = instances.filter(i => i.state === 'failed');
+  if (instances.length === 1) {
+    if (running.length && running[0].pid) return `隧道运行中 · PID ${running[0].pid}`;
+    return failed.length ? '隧道启动失败' : '隧道已停止';
+  }
+  return `隧道客户端 ${instances.length} 个 · 运行 ${running.length}`;
+}
+
 export function getTunnelStatusDescription(tc, mcp) {
   const bindingType = mcp?.binding?.type || 'stdio';
   if (!tc || !tc.state || tc.state === 'unobserved') {
@@ -1913,17 +2376,19 @@ export function countRunningInstances(instances) {
 
 // Collapsed by default for 0-1 instances; auto-expanded once >=2 are RUNNING.
 // An explicit user toggle always wins over the automatic decision.
-export function shouldExpandInstanceSection(mcpId, instances) {
+export function shouldExpandInstanceSection(mcpId) {
   const override = appState.instanceSectionOverrides.get(mcpId);
   if (override === true || override === false) return override;
-  return countRunningInstances(instances) >= 2;
+  // Default to EXPANDED, even with zero tunnel-clients: the list is a fixed-height
+  // scroll region, and collapsing it hid the scrollbar so there was nothing to grab.
+  return true;
 }
 
 export function toggleInstanceSection(mcpId) {
   if (!mcpId) return;
   const mcp = appState.mcps.find(item => item.id === mcpId);
   const instances = getMcpInstances(mcp);
-  const current = shouldExpandInstanceSection(mcpId, instances);
+  const current = shouldExpandInstanceSection(mcpId);
   appState.instanceSectionOverrides.set(mcpId, !current);
   renderMcpsRegistryGrid();
 }
@@ -1938,6 +2403,15 @@ export function isLoopbackHealthURL(healthURL) {
   } catch {
     return false;
   }
+}
+
+/** Short, human-readable local timestamp (MM-DD HH:mm:ss). */
+export function formatShortLocalTime(value) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 export function formatInstanceEndpoint(instance) {
@@ -2010,6 +2484,30 @@ export function formatInstanceAccount(instance) {
   const profileLabel = instance.profileLabel ? String(instance.profileLabel) : '';
   if (profileLabel && profileId) return `${profileLabel} (${profileId})`;
   return profileLabel || profileId || '-';
+}
+
+/**
+ * Primary row headline: the tunnel-client PROCESS itself, with its PID.
+ * The tunnel id is deliberately demoted to a meta field — a masked tunnel id
+ * says little to the operator, whereas "process running (PID: 23720)" is the
+ * thing they actually act on.
+ */
+export function formatProcessHeadline(instance) {
+  const state = instance?.state || 'unobserved';
+  const pid = Number.isSafeInteger(instance?.pid) && instance.pid > 0 ? instance.pid : null;
+  switch (state) {
+    case 'running':
+      return instance?.managed === true
+        ? { text: '隧道客户端进程正常运行', pid, tone: 'ok' }
+        : { text: '隧道客户端进程运行中（未接管）', pid, tone: 'warn' };
+    case 'starting': return { text: '隧道客户端进程启动中', pid, tone: 'busy' };
+    case 'stopping': return { text: '隧道客户端进程停止中', pid, tone: 'busy' };
+    case 'restarting': return { text: '隧道客户端进程重启中', pid, tone: 'busy' };
+    case 'stopped': return { text: '隧道客户端进程已停止', pid: null, tone: 'idle' };
+    case 'failed': return { text: '隧道客户端进程启动失败', pid: null, tone: 'bad' };
+    case 'unmanaged': return { text: '隧道客户端进程未接管', pid, tone: 'warn' };
+    default: return { text: '隧道客户端进程状态未知', pid, tone: 'idle' };
+  }
 }
 
 // Per-row button gating, mirroring the existing start/restart/stop card rules.
@@ -2086,14 +2584,14 @@ export function renderMcpInstanceSection(mcp) {
   const instances = getMcpInstances(mcp);
   const instanceCount = instances.length;
   const runningCount = countRunningInstances(instances);
-  const expanded = shouldExpandInstanceSection(mcp.id, instances);
+  const expanded = shouldExpandInstanceSection(mcp.id);
   const eligibleProfiles = getEligibleProfilesForService(mcp.id);
 
   const header = `
     <button type="button" class="instance-section-toggle" data-action="toggle-instances" data-id="${escapeHtml(mcp.id)}"
             aria-expanded="${expanded ? 'true' : 'false'}">
       <span class="instance-section-caret" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
-      <span class="instance-section-title">多账号实例 (${instanceCount})</span>
+      <span class="instance-section-title">隧道客户端进程 (${instanceCount})</span>
       ${runningCount > 0 ? `<span class="badge badge-running">运行中 ${runningCount}</span>` : ''}
     </button>
   `;
@@ -2102,53 +2600,65 @@ export function renderMcpInstanceSection(mcp) {
     return `
       <div class="instance-section${expanded ? ' instance-section-expanded' : ''}">
         ${header}
-        <div class="instance-list${expanded ? '' : ' hidden'}">
-          <div class="instance-empty">该服务暂无并发账号实例记录。</div>
+        <div class="instance-list${expanded ? '' : ' hidden'} scroll-area scroll-fade">
+          <div class="instance-empty">该服务暂无 tunnel-client 记录。</div>
         </div>
       </div>
     `;
   }
 
-  const rows = instances.map(instance => {
+  const ordered = instances.slice().sort((a, b) => {
+    const rank = (i) => (i?.state === 'running' ? 0 : i?.state === 'failed' ? 2 : 1);
+    return rank(a) - rank(b)
+      || String(a.profileLabel || '').localeCompare(String(b.profileLabel || ''))
+      || String(a.maskedTunnelId || '').localeCompare(String(b.maskedTunnelId || ''));
+  });
+  const rows = ordered.map(instance => {
     const gating = getInstanceActionGating(mcp, instance, eligibleProfiles);
     const profileLabel = escapeHtml(instance.profileLabel || instance.profileId || '-');
     const profileId = escapeHtml(instance.profileId || '-');
-    const pid = Number.isSafeInteger(instance.pid) && instance.pid > 0 ? String(instance.pid) : '-';
-    // already masked server-side: rendered verbatim, never unmasked
     const maskedTunnel = instance.maskedTunnelId ? escapeHtml(instance.maskedTunnelId) : '-';
-    const endpoint = escapeHtml(formatInstanceEndpoint(instance));
-    const startedAt = instance.startedAt ? escapeHtml(String(instance.startedAt)) : '-';
+    const isRunning = instance?.state === 'running';
+    // A stopped instance keeps historical values from its last run; showing them as
+    // if current is misleading, so only live cards display port / start time.
+    const endpoint = isRunning ? escapeHtml(formatInstanceEndpoint(instance)) : '-';
+    const startedAt = isRunning && instance.startedAt ? escapeHtml(formatShortLocalTime(instance.startedAt)) : '-';
+    const headline = formatProcessHeadline(instance);
     const btn = (action, label, cls, gate) => `
       <button type="button" class="btn btn-sm ${cls} instance-action-btn"
               data-action="${action}"
               data-id="${escapeHtml(mcp.id)}"
               data-profile-id="${profileId}"
-              ${gate.disabled ? `disabled title="${escapeHtml(gate.title)}"` : `title="${escapeHtml(label)}该账号实例"`}>
+              ${gate.disabled ? `disabled title="${escapeHtml(gate.title)}"` : `title="${escapeHtml(label)}该账号的隧道客户端"`}>
         ${escapeHtml(label)}
       </button>`;
 
     const carrierBanner = gating.confirmationPending
-      ? `<div class="instance-confirm-banner" role="alert">
-           <span class="instance-confirm-text">该服务承载控制平面 (Carrier) 连接，需确认后方可停止或重启。</span>
+      ? `<div class="tc-carrier-banner" role="alert">
+           <span>该服务承载控制平面 (Carrier) 连接，需确认后方可停止或重启。</span>
            <button type="button" class="btn btn-sm btn-warning" data-action="cancel-carrier"
                    data-id="${escapeHtml(mcp.id)}" data-profile-id="${profileId}">取消确认</button>
          </div>`
       : '';
 
+    // One tunnel-client == one card. Everything is stacked vertically so the
+    // action buttons can never overflow a fixed grid column.
     return `
-      <div class="instance-row" data-instance-key="${escapeHtml(buildInstanceRowKey(mcp.id, instance.profileId))}">
-        <div class="instance-account" title="运行账号">
-          <span class="instance-account-label">${profileLabel}</span>
-          <span class="instance-account-id font-mono">${profileId}</span>
+      <div class="tunnel-client-card tc-tone-${headline.tone}"
+           data-instance-key="${escapeHtml(buildInstanceRowKey(mcp.id, instance.profileId))}"
+           data-tunnel-id="${maskedTunnel}">
+        <div class="tc-head">
+          <span class="tc-dot" aria-hidden="true"></span>
+          <span class="tc-state">${escapeHtml(headline.text)}</span>
+          ${headline.pid ? `<span class="tc-pid font-mono">PID ${headline.pid}</span>` : ''}
+          <span class="tc-account" title="运行账号">${profileLabel}</span>
         </div>
-        <div class="instance-state">${formatInstanceStateBadge(instance)}</div>
-        <div class="instance-meta">
-          <span class="instance-meta-item" title="进程 PID">PID: <span class="font-mono">${escapeHtml(pid)}</span></span>
-          <span class="instance-meta-item" title="隧道 ID（服务端已脱敏）">隧道: <span class="font-mono">${maskedTunnel}</span></span>
-          <span class="instance-meta-item" title="本地端口 / 回环健康地址">端口: <span class="font-mono">${endpoint}</span></span>
-          <span class="instance-meta-item" title="启动时间">启动: <span class="font-mono">${startedAt}</span></span>
+        <div class="tc-meta">
+          <span class="tc-meta-item"><span class="tc-meta-key">隧道</span><span class="font-mono">${maskedTunnel}</span></span>
+          <span class="tc-meta-item"><span class="tc-meta-key">端口</span><span class="font-mono">${endpoint}</span></span>
+          <span class="tc-meta-item"><span class="tc-meta-key">启动</span><span class="font-mono">${startedAt}</span></span>
         </div>
-        <div class="instance-actions">
+        <div class="tc-actions">
           ${btn('start', '启动', 'btn-primary', gating.start)}
           ${btn('stop', '停止', 'btn-danger', gating.stop)}
           ${btn('restart', '重启', 'btn-secondary', gating.restart)}
@@ -2161,7 +2671,7 @@ export function renderMcpInstanceSection(mcp) {
   return `
     <div class="instance-section${expanded ? ' instance-section-expanded' : ''}">
       ${header}
-      <div class="instance-list${expanded ? '' : ' hidden'}">
+      <div class="instance-list${expanded ? '' : ' hidden'} scroll-area scroll-fade">
         ${rows}
         <div class="instance-hint">每个账号可独立启动一个隧道实例；启动 / 停止 / 重启仅影响该账号实例，不会影响其他账号。</div>
       </div>
@@ -2252,7 +2762,10 @@ export function startInstanceActionPolling(serviceId, profileId, action) {
     appState.instanceActionPending.delete(rowKey);
   };
 
+  let pollInFlight = false;
   const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     if (entry.done) return;
     try {
       const instances = await fetchMcpInstances(serviceId);
@@ -2271,6 +2784,8 @@ export function startInstanceActionPolling(serviceId, profileId, action) {
       }
     } catch (pollErr) {
       console.warn('Instance polling warning:', pollErr);
+    } finally {
+      pollInFlight = false;
     }
   };
 
@@ -2307,7 +2822,8 @@ export async function handleInstanceAction(serviceId, profileId, action, options
   renderMcpsRegistryGrid();
 
   const body = {
-    expectedRevision: appState.revision,
+    // Instance actions are scoped to one instance; sending a cached global
+    // revision here makes a second action fail with REVISION_CONFLICT.
     profileId
   };
   if (carrierToken) body.carrierToken = carrierToken;
@@ -2391,10 +2907,12 @@ export function renderMcpsRegistryGrid() {
         <p>暂无任何注册的 MCP 服务。点击上方“添加 MCP 服务”或“发现本机配置”开始。</p>
       </div>
     `;
+    if (dom.mcpsPager) { dom.mcpsPager.innerHTML = ''; dom.mcpsPager.classList.add('hidden'); }
     return;
   }
 
-  appState.mcps.forEach(mcp => {
+  const mcpsPage = pageSlice('mcps', appState.mcps);
+  mcpsPage.items.forEach(mcp => {
     const tc = mcp.runtime?.tunnelClient || {};
     const tcState = tc.state || 'unobserved';
     const isOwned = tc.managed === true;
@@ -2475,7 +2993,8 @@ export function renderMcpsRegistryGrid() {
     }
 
     const card = document.createElement('div');
-    card.className = `mcp-card ${isRunning ? 'running' : ''} ${!isEnabled ? 'disabled' : ''}`;
+    card.className = `mcp-card mcp-card-clickable ${isRunning ? 'running' : ''} ${!isEnabled ? 'disabled' : ''}`;
+    card.title = '点击查看详情';
     card.dataset.mcpId = mcp.id;
 
     // Build binding summary text
@@ -2518,6 +3037,10 @@ export function renderMcpsRegistryGrid() {
       provBadge = `<span class="badge badge-subtle">来源: ${escapeHtml(mcp.provenance.sourceKind || mcp.provenance.kind)}</span>`;
     }
 
+    // Instance rows win over the single legacy `runtime.tunnelClient` descriptor.
+    const tunnelClientsSummary = describeTunnelClients(mcp);
+    const tunnelClientsBadgeText = tunnelClientsBadge(mcp);
+
     card.innerHTML = `
       <div class="mcp-card-header">
         <div class="mcp-card-title">
@@ -2529,7 +3052,9 @@ export function renderMcpsRegistryGrid() {
           ${mcp.controlCarrier ? '<span class="badge badge-subtle" title="控制平面承载">Carrier</span>' : ''}
           ${isEnabled ? '<span class="badge badge-success">已启用</span>' : '<span class="badge badge-warning">已禁用</span>'}
           ${formatObservationBadge(mcp.runtime?.observation)}
-          ${formatTunnelClientBadge(mcp.runtime?.tunnelClient)}
+          ${tunnelClientsBadgeText
+            ? `<span class="badge badge-subtle">${escapeHtml(tunnelClientsBadgeText)}</span>`
+            : formatTunnelClientBadge(mcp.runtime?.tunnelClient)}
           ${isPendingApply ? '<span class="badge badge-pending-apply" title="配置已更新，需重新切换方可生效">待应用</span>' : ''}
           ${provBadge}
         </div>
@@ -2539,7 +3064,7 @@ export function renderMcpsRegistryGrid() {
         ${bindingSummary}
         <div class="binding-field-row" style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(255, 255, 255, 0.07);">
           <span class="binding-field-label">隧道进程:</span>
-          <span class="binding-field-value font-mono" style="font-size: 12px;">${escapeHtml(getTunnelStatusDescription(mcp.runtime?.tunnelClient, mcp))}</span>
+          <span class="binding-field-value font-mono" style="font-size: 12px;">${escapeHtml(tunnelClientsSummary || getTunnelStatusDescription(mcp.runtime?.tunnelClient, mcp))}</span>
         </div>
       </div>
 
@@ -2575,6 +3100,13 @@ export function renderMcpsRegistryGrid() {
     card.querySelector('.btn-mcp-stop')?.addEventListener('click', () => openTunnelActionModal(mcp, 'stop'));
     card.querySelector('.btn-mcp-delete')?.addEventListener('click', () => openLifecycleModal(mcp, 'delete'));
 
+    // The whole card opens the details modal. Interactive children (buttons,
+    // inputs, links, labels, instance rows) keep their own behaviour.
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('button, a, input, select, textarea, label, [data-action]')) return;
+      openLocationsModal(mcp);
+    });
+
     // Bind per-account instance section actions (additive; card buttons untouched)
     card.querySelector('[data-action="toggle-instances"]')?.addEventListener('click', () => toggleInstanceSection(mcp.id));
     card.querySelectorAll('.instance-action-btn').forEach(btn => {
@@ -2595,6 +3127,12 @@ export function renderMcpsRegistryGrid() {
 
     dom.mcpsContainer.appendChild(card);
   });
+
+  renderPager('mcps', mcpsPage.total, mcpsPage.page, mcpsPage.size, (target) => {
+    appState.page.mcps = target;
+    renderMcpsRegistryGrid();
+  });
+  refreshScrollAffordances();
 }
 
 // --------------------------------------------------------------------------
@@ -2925,7 +3463,10 @@ export async function openLocationsModal(mcp) {
       <div class="summary-chip"><strong>服务 ID:</strong> <span class="font-mono">${escapeHtml(mcp.id)}</span></div>
       <div class="summary-chip"><strong>类型:</strong> <span>${bindingType.toUpperCase()}</span></div>
       <div class="summary-chip"><strong>MCP 连接:</strong> <span>${formatObservationBadge(mcp.runtime?.observation)}</span></div>
-      <div class="summary-chip"><strong>隧道进程:</strong> <span>${formatTunnelClientBadge(mcp.runtime?.tunnelClient)}</span></div>
+      <div class="summary-chip"><strong>隧道进程:</strong> <span>${(() => {
+        const t = tunnelClientsBadge(mcp);
+        return t ? escapeHtml(t) : formatTunnelClientBadge(mcp.runtime?.tunnelClient);
+      })()}</span></div>
       ${mcp.runtime?.pendingApply ? '<div class="summary-chip"><span class="badge badge-pending-apply">待应用</span></div>' : ''}
     `;
   }
@@ -3176,7 +3717,10 @@ export function startStopPolling(operationId, mcp) {
     clearInterval(appState.lifecycleStopTimer);
   }
 
+  let pollInFlight = false;
   const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const op = await apiRequest(`/api/operations/${encodeURIComponent(operationId)}`);
       const status = (op.status || op.phase || '').toUpperCase();
@@ -3220,6 +3764,8 @@ export function startStopPolling(operationId, mcp) {
       }
     } catch (pollErr) {
       console.warn('Stop polling warning:', pollErr);
+    } finally {
+      pollInFlight = false;
     }
   };
 
@@ -3460,7 +4006,10 @@ export function startTunnelActionPolling(operationId, mcp, action) {
     clearInterval(appState.tunnelActionTimer);
   }
 
+  let pollInFlight = false;
   const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const op = await apiRequest(`/api/operations/${encodeURIComponent(operationId)}`);
       const status = (op.status || op.phase || '').toUpperCase();
@@ -3505,6 +4054,8 @@ export function startTunnelActionPolling(operationId, mcp, action) {
       }
     } catch (pollErr) {
       console.warn('Tunnel action polling warning:', pollErr);
+    } finally {
+      pollInFlight = false;
     }
   };
 
@@ -3824,8 +4375,11 @@ export function bindEventListeners() {
   dom.tabNavMcps?.addEventListener('click', () => switchDashboardTab('mcps'));
 
   // Switch Control
-  dom.switchProfileSelect?.addEventListener('change', updateSelectedProfilePreview);
+  // Checkbox list is the primary multi-select control.
+  dom.switchProfilesList?.addEventListener('change', updateSelectedProfilePreview);
   dom.btnExecuteSwitch?.addEventListener('click', handleExecuteSwitch);
+  dom.btnParallelStart?.addEventListener('click', handleParallelStartSelected);
+  dom.btnStopAllTunnelClients?.addEventListener('click', handleStopAllTunnelClients);
 
   // Profile Modal
   dom.btnOpenCreateModal?.addEventListener('click', openCreateProfileModal);
@@ -3898,6 +4452,57 @@ export function bindEventListeners() {
   dom.discoveryImportModal?.addEventListener('click', (e) => {
     if (e.target === dom.discoveryImportModal) closeImportModal();
   });
+
+  dom.codexBridgeToggle?.addEventListener('change', handleCodexBridgeToggle);
+}
+
+// ==========================================================================
+// Codex 桥接开关
+// ==========================================================================
+
+export async function loadCodexBridgeSetting() {
+  if (!dom.codexBridgeToggle) return;
+  try {
+    const data = await apiRequest('/api/settings/codex-bridge');
+    applyCodexBridgeState(data?.enabled !== false);
+  } catch (err) {
+    if (dom.codexBridgeLabel) dom.codexBridgeLabel.textContent = '读取失败';
+    if (dom.codexBridgeHint) dom.codexBridgeHint.textContent = '';
+  }
+}
+
+function applyCodexBridgeState(enabled) {
+  if (dom.codexBridgeToggle) dom.codexBridgeToggle.checked = enabled;
+  if (dom.codexBridgeLabel) dom.codexBridgeLabel.textContent = enabled ? '已开启' : '已关闭';
+  if (dom.codexBridgeHint) {
+    dom.codexBridgeHint.textContent = enabled
+      ? '当前每个隧道会额外拉起一份 codex app-server（约 96 MB）。'
+      : '隧道启动时将不拉起 codex app-server；MCP 调用不受影响。';
+  }
+}
+
+export async function handleCodexBridgeToggle(e) {
+  const enabled = Boolean(e.target.checked);
+  dom.codexBridgeToggle.disabled = true;
+  try {
+    const data = await apiRequest('/api/settings/codex-bridge', {
+      method: 'POST',
+      body: { enabled }
+    });
+    applyCodexBridgeState(data?.enabled !== false);
+    if (dom.codexBridgeHint) {
+      dom.codexBridgeHint.textContent = (data?.enabled !== false
+        ? '已开启'
+        : '已关闭') + '。重启相关隧道后生效。';
+    }
+  } catch (err) {
+    // 回滚 UI 到实际保存失败的相反状态
+    dom.codexBridgeToggle.checked = !enabled;
+    const parsed = formatSafeError(err);
+    showAlert('error', '设置保存失败', parsed.displayText);
+  } finally {
+    dom.codexBridgeToggle.disabled = false;
+  }
 }
 
 // ==========================================================================

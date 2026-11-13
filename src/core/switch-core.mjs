@@ -105,7 +105,40 @@ export async function executeOperation(operationId, d) {
       return rollbackOperation(operationId, d, 'INTERRUPTED');
     }
     let activeService = null;
+    const admissions = [];
     try {
+      // RESOURCE PREFLIGHT: a switch/restart must be refused before any old
+      // client is stopped. Reservations are shared with the service/instance
+      // entries through the runner's single policy object.
+      //
+      // A switch is SERIAL over its targets, so it takes ONE batch reservation
+      // (one concurrency slot, memory for the heaviest role) instead of one
+      // reservation per target. Per-target reservations made a legitimate 3+
+      // service switch refuse itself against a 2-slot budget, because the batch
+      // held every slot before it ran while the work was strictly sequential.
+      if (typeof d.resourcePolicy?.admitBatch === 'function') {
+        const targets = operationTargets(op);
+        const carriers = targets.map(service => Array.isArray(op.registrySnapshot?.services)
+          && op.registrySnapshot.services.some(def => def?.id === service && def.controlCarrier === true));
+        try {
+          admissions.push(await d.resourcePolicy.admitBatch({
+            serviceIds: targets, carriers, kind: 'switch'
+          }));
+        } catch (_) {
+          throw new SwitchFault('RESOURCE_ADMISSION_FAILED');
+        }
+      } else if (typeof d.resourcePolicy?.admitStart === 'function') {
+        const targets = operationTargets(op);
+        for (const service of targets) {
+          const carrier = Array.isArray(op.registrySnapshot?.services)
+            && op.registrySnapshot.services.some(def => def?.id === service && def.controlCarrier === true);
+          try {
+            admissions.push(await d.resourcePolicy.admitStart({ serviceId: service, carrier, kind: 'switch' }));
+          } catch (_) {
+            throw new SwitchFault('RESOURCE_ADMISSION_FAILED');
+          }
+        }
+      }
       // Short atomic DB transaction: check expected global revision, pinned
       // profile revision, sole active operation and recovery gate, then PREPARING.
       await d.repo.begin(operationId);
@@ -172,6 +205,10 @@ export async function executeOperation(operationId, d) {
         service: activeService,
         reason: error instanceof SwitchFault ? safeFailureReason(error.reason) : null
       });
+    } finally {
+      for (const admission of admissions) {
+        try { d.resourcePolicy?.release?.(admission); } catch (_) {}
+      }
     }
   });
 }

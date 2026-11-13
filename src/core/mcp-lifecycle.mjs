@@ -84,7 +84,7 @@ async function finishSuccess(repo, actionId, receipt, meta = {}) {
  * @param {object} [params.vault] - Vault instance for carrier token / credentials
  * @returns {Promise<object>} Public action DTO
  */
-export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, vault }) {
+export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, vault, resourcePolicy = null }) {
   if (!repo || typeof repo !== 'object') {
     throw new TypeError('A valid repo object is required to run lifecycle action');
   }
@@ -116,6 +116,7 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
   }
 
   let sideEffectsInitiated = false;
+  let admission = null;
   try {
     if (!action.serviceId) {
       const err = new Error('Missing serviceId');
@@ -172,7 +173,11 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
           identityVerified = false;
         }
       } else {
-        identityVerified = true;
+        // No verifier means no proof of identity. Treating the absence of a
+        // verifier as success published a `running` snapshot for a pid that was
+        // merely alive, so a recycled pid (or a foreign process) could be driven
+        // as if it were this service's tunnel.
+        identityVerified = false;
       }
     }
 
@@ -320,11 +325,77 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
     }
 
     if (decision.decision === 'noop') {
+      /*
+       * ALREADY_STOPPED is the one noop that proves the service has no live
+       * client: decideTunnelClientAction only reaches it when the snapshot says
+       * `stopped` AND `absenceVerified === true`, i.e. the authoritative
+       * inspection succeeded and reported no process.
+       *
+       * The legacy `active_profiles` pointer is what remove() reads, and this
+       * path never went through finishLifecycleAction, so nothing cleared it.
+       * A tunnel that died outside the console therefore kept reading as
+       * `running`: removal failed 409 MCP_RUNNING, the UI advised "stop it
+       * first", that advice returned ALREADY_STOPPED, and the pointer survived
+       * the advice. Clearing it here breaks that loop.
+       *
+       * Scope guard: ONLY a stop noop with verified absence. An ALREADY_RUNNING
+       * noop must never drop the pointer, and an unverified `stopped` claim is
+       * not absence (decideTunnelClientAction rejects it as STATE_UNVERIFIED
+       * before reaching here).
+       */
+      if (actionKind === 'stop' && decision.code === 'ALREADY_STOPPED'
+          && snapshot.absenceVerified === true) {
+        try {
+          if (typeof repo.registry?.handleClearActiveService === 'function') {
+            repo.registry.handleClearActiveService(action.serviceId);
+          } else if (typeof repo.clearActiveService === 'function') {
+            repo.clearActiveService(action.serviceId);
+          }
+        } catch (_) {}
+        const noopObserver = typeof repo.getObserver === 'function'
+          ? repo.getObserver()
+          : (typeof repo.registry?.getObserver === 'function' ? repo.registry.getObserver() : null);
+        try {
+          if (noopObserver && typeof noopObserver.setTunnelClient === 'function') {
+            noopObserver.setTunnelClient(action.serviceId, {
+              state: 'stopped',
+              managed: true,
+              pid: null,
+              startedAt: null,
+              profileId: null,
+              operationId: null,
+              observedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 90000).toISOString(),
+              reasonCode: 'process_stopped',
+              lastExitCode: null,
+              absenceVerified: true
+            });
+          }
+        } catch (_) {}
+      }
       await repo.transitionAction(actionId, { state: 'SUCCEEDED' });
       return await getPublicAction(repo, actionId);
     }
 
     // decision === 'enqueue' -> execute!
+    //
+    // RESOURCE ADMISSION comes before every effect, and specifically before a
+    // restart stops its old process: refusing here leaves the existing client
+    // running, while checking after the stop would leave the service down.
+    if ((actionKind === 'start' || actionKind === 'restart') && typeof resourcePolicy?.admitStart === 'function') {
+      try {
+        admission = await resourcePolicy.admitStart({
+          serviceId: action.serviceId,
+          // Trusted server-side carrier flag; an HTTP body cannot set this.
+          carrier: controlCarrier === true,
+          kind: actionKind
+        });
+      } catch (admissionError) {
+        await markRejected(repo, actionId, admissionError?.code || 'RESOURCE_ADMISSION_FAILED');
+        return await getPublicAction(repo, actionId);
+      }
+    }
+
     if (typeof repo.transitionAction === 'function') {
       await repo.transitionAction(actionId, { state: 'APPLYING' });
     } else if (typeof repo.phase === 'function') {
@@ -362,7 +433,12 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
           observedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + 90000).toISOString(),
           reasonCode: 'process_stopped',
-          lastExitCode: null
+          lastExitCode: null,
+          // Proven absence: stopConnection's receipt was asserted above
+          // (assertStoppedConnectionReceipt). This is the only place a VERIFIED
+          // stop may claim absence, and it is what the ALREADY_STOPPED guard and
+          // removal decision consume.
+          absenceVerified: true
         });
       }
       await finishSuccess(repo, actionId, receipt, { action: 'stop' });
@@ -421,7 +497,11 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
           observedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + 90000).toISOString(),
           reasonCode: 'process_verified_running',
-          lastExitCode: null
+          lastExitCode: null,
+          // A running client is the opposite of proven absence. State it
+          // explicitly so a stale `absenceVerified: true` can never survive a
+          // restart and let the ALREADY_STOPPED guard fire on a live tunnel.
+          absenceVerified: false
         });
       }
 
@@ -446,6 +526,12 @@ export async function runMcpLifecycleAction({ repo, adapterProvider, actionId, v
       await markAttention(repo, actionId, code);
     }
     return await getPublicAction(repo, actionId);
+  } finally {
+    // Success or failure, the budget acquired for this action is returned; a
+    // leaked reservation would eventually refuse every new normal start.
+    if (admission && typeof resourcePolicy?.release === 'function') {
+      try { resourcePolicy.release(admission); } catch (_) {}
+    }
   }
 }
 

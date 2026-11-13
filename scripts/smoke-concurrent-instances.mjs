@@ -60,6 +60,26 @@ const PROCESS_CONTROL = path.join(PROJECT_ROOT, 'scripts', 'process-control.ps1'
 
 const CONSOLE_PORT = 17643;
 const PRODUCTION_CONSOLE_PORT = 17642;
+
+/**
+ * Default demo port. Overridable with `--port <n>` because 17643 is a shared dev port:
+ * on a machine where another console already holds it, the run would abort at the
+ * fail-fast probe and this acceptance command could not be executed at all. The
+ * production port is still refused in every case (see below).
+ */
+function resolveConsolePort(options) {
+  const raw = options?.port;
+  if (raw === undefined || raw === null) return CONSOLE_PORT;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 65535) {
+    throw new Error(`--port must be a valid TCP port, got '${raw}'`);
+  }
+  if (parsed === PRODUCTION_CONSOLE_PORT) {
+    throw new Error(`--port ${parsed} is the production console port; the demo must never use it`);
+  }
+  return parsed;
+}
+
 const SERVICE_ID = 'mcp_instancesvc';
 const PROFILE_A = 'userA';
 const PROFILE_B = 'userB';
@@ -456,12 +476,14 @@ async function assertDaemonListening(localPort) {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const options = { dataDir: null, keepDataDir: false };
+  const options = { dataDir: null, keepDataDir: false, port: null };
   for (let i = 2; i < argv.length; i += 1) {
     if (argv[i] === '--data-dir' && i + 1 < argv.length) {
       options.dataDir = argv[i += 1];
     } else if (argv[i] === '--keep-data-dir') {
       options.keepDataDir = true;
+    } else if (argv[i] === '--port' && i + 1 < argv.length) {
+      options.port = argv[i += 1];
     }
   }
   return options;
@@ -469,6 +491,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv);
+  const consolePort = resolveConsolePort(options);
   const startedAt = new Date().toISOString();
   const cleanups = [];
 
@@ -478,10 +501,10 @@ async function main() {
     const probe = http.createServer();
     probe.once('error', () => resolve(true));
     probe.once('listening', () => probe.close(() => resolve(false)));
-    probe.listen(CONSOLE_PORT, '127.0.0.1');
+    probe.listen(consolePort, '127.0.0.1');
   });
-  if (portTaken) throw new Error(`port ${CONSOLE_PORT} is already in use; refusing to start the demo console`);
-  if (CONSOLE_PORT === PRODUCTION_CONSOLE_PORT) throw new Error('the demo console must never use the production port');
+  if (portTaken) throw new Error(`port ${consolePort} is already in use; refusing to start the demo console (pass --port <n> to use a free one)`);
+  if (consolePort === PRODUCTION_CONSOLE_PORT) throw new Error('the demo console must never use the production port');
 
   // -- 1. Production snapshot BEFORE -----------------------------------------
   const before = snapshotProduction('before');
@@ -696,7 +719,7 @@ async function main() {
 
     manager = await startManager({
       dataDir,
-      port: CONSOLE_PORT,
+      port: consolePort,
       security: createLocalSecurity(),
       vault,
       store,
@@ -710,7 +733,7 @@ async function main() {
     });
     cleanups.push(async () => { await manager?.close?.(); });
 
-    const baseUrl = manager.url || `http://127.0.0.1:${CONSOLE_PORT}`;
+    const baseUrl = manager.url || `http://127.0.0.1:${consolePort}`;
     log(`demo console listening on ${baseUrl} (dataDir=${dataDir})`);
 
     // -- 4. One service, two accounts ---------------------------------------
@@ -818,7 +841,7 @@ async function main() {
     log(`both running again: A pid=${rowA2.pid} port=${rowA2.localPort}, B pid=${rowB2.pid} port=${rowB2.localPort}`);
 
     const summary = {
-      port: CONSOLE_PORT,
+      port: consolePort,
       dataDir,
       instances: [rowA2, rowB2].map((row) => ({
         instanceId: row.instanceId,

@@ -146,7 +146,10 @@ test('1.2 Two clear major regions: 账号配置 (Account Config) and MCP服务 (
 
 test('1.3 Switch control targets container is dynamic (not hardcoded to overleaf & antigravity only)', () => {
   assert.match(indexHtml, /id="switch-targets-container"/, 'Dynamic switch targets container must exist');
-  assert.match(indexHtml, /id="switch-profile-select"/, 'Profile select dropdown must exist');
+  // Accounts are chosen through a checkbox list (multi-select), not a native
+  // <select multiple> (which would have required Ctrl+click).
+  assert.match(indexHtml, /id="switch-profiles-list"/, 'Profile checkbox list must exist');
+  assert.doesNotMatch(indexHtml, /id="switch-profile-select"/, 'No native multi-select dropdown');
   assert.match(indexHtml, /id="btn-execute-switch"/, 'Execute switch button must exist');
   assert.match(indexHtml, /id="operation-progress-card"/, 'Progress card must exist');
 });

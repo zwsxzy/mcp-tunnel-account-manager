@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeObservation } from './adapters/runtime-observer.mjs';
+import { isProcessAlive } from './core/process-liveness.mjs';
 import {
   isMcpServiceId,
   LEGACY_SERVICES,
@@ -306,6 +307,12 @@ function formatRuntime(serviceId, serviceRevision, runtime, observer = null) {
     observation
   };
   if (tunnelClient !== undefined) res.tunnelClient = tunnelClient;
+  // Additive (contract §4): the console reads `mcp.runtime.instances` to render the
+  // per-account rows, so this MUST be forwarded from the runtime provider. It was
+  // being dropped here, which left the UI with an always-empty instance list even
+  // though `instance_runtime` held the rows. Absent => `[]`, never undefined, so
+  // callers can iterate unconditionally.
+  res.instances = Array.isArray(runtime?.instances) ? runtime.instances : [];
   return res;
 }
 
@@ -384,6 +391,141 @@ function computeLifecycleActionFingerprint(action, serviceId, profileId, expecte
   return createHash('sha256').update(JSON.stringify(norm)).digest('hex');
 }
 
+/**
+ * Decides what the REMOVAL guard may believe about a service's runtime.
+ *
+ * Why this exists: `remove()` used to read `rt.runtimeState`, which the store
+ * derives from the legacy `active_profiles` pointer alone. A pointer left behind
+ * by a tunnel that died outside the console therefore read as `running` forever:
+ * removal returned 409 MCP_RUNNING, the UI advised "stop it first", that advice
+ * landed on an ALREADY_STOPPED noop (which never cleared the pointer), and the
+ * service could never be deleted.
+ *
+ * Rules, in priority order (blocking evidence first):
+ *   1. ANY instance row that holds a live pid blocks removal, whatever state that
+ *      row records -- a real tunnel must never be archived.
+ *   2. A declared transition blocks, and so does a `running` row with no pid: a
+ *      missing pid is an UNRESOLVED claim, never a dead process.
+ *   3. Over the observation channels (observer row, then the DTO's tunnelClient),
+ *      ALL blocking evidence is evaluated before ANY permitting evidence: a live
+ *      pid, a declared transition, or an unresolved `running` claim anywhere in
+ *      that set wins over a `stopped` / dead-pid row sitting beside it. Reaching
+ *      the permitting checks therefore means the whole set was already consulted.
+ *   4. Synthetic placeholders (`synthetic: true`, emitted when the observer has
+ *      no row or its observation expired), a missing observation, an unknown
+ *      identity, and an empty instance array are NOT absence proof on their own.
+ *   5. Only then may a non-synthetic `stopped` row or a pid that genuinely no
+ *      longer exists be read as absent, followed by the store's own pointer fact
+ *      ("no active profile") plus the absence of any live instance pid.
+ *
+ * Everything else resolves to `unknown`, and `removalDecision` keeps rejecting
+ * it with 409 RUNTIME_STATE_UNKNOWN instead of deleting on a guess.
+ */
+export function resolveRemovalRuntimeState({ serviceId, rt, observer, isAlive = isProcessAlive } = {}) {
+  const pidOf = (row) => {
+    const pid = Number(row?.pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  };
+  const rows = Array.isArray(rt?.instances) ? rt.instances.filter(row => row && typeof row === 'object') : [];
+
+  // Blocking pass 1 -- EVERY row, not just `running`/`starting`. Filtering by state
+  // here let a row that still carried a live pid under unmanaged/stopped/failed be
+  // skipped; the permitting evidence that followed then allowed the deletion.
+  const liveRow = rows.find(row => isAlive(pidOf(row)));
+  if (liveRow) return { state: 'running', evidence: 'instance_pid_alive' };
+
+  if (rt?.state === 'running' || rt?.state === 'starting') {
+    // Legacy/explicit DTO claim: a claim may always BLOCK, never permit.
+    return { state: rt.state, evidence: 'dto_state_claim' };
+  }
+
+  const transitionRow = rows.find(row => ['starting', 'stopping', 'restarting'].includes(row.state));
+  if (transitionRow) return { state: 'starting', evidence: 'instance_transition' };
+
+  // Blocking pass 2 -- a `running` row without a pid is unresolved, not absent.
+  // It must be rejected BEFORE any observation is allowed to permit.
+  if (rows.some(row => row.state === 'running' && pidOf(row) === null)) {
+    return { state: 'unknown', evidence: 'instance_running_without_pid' };
+  }
+
+  let observed = null;
+  try {
+    observed = typeof observer?.peekTunnelClient === 'function' ? observer.peekTunnelClient(serviceId) : null;
+  } catch (_) {
+    observed = null;
+  }
+  // Every real observation channel, collected up front so the permitting checks
+  // below cannot run before the blocking ones have seen the WHOLE set. Previously
+  // the loop returned on the first candidate, so a `stopped` or dead-pid row hid a
+  // live / unresolved / transitioning claim sitting right behind it.
+  const candidates = [observed, rt?.tunnelClient]
+    .filter(c => c && typeof c === 'object' && c.synthetic !== true);
+
+  // Blocking pass 3a -- a live pid anywhere in the set wins.
+  for (const candidate of candidates) {
+    const pid = pidOf(candidate);
+    if (pid && isAlive(pid)) return { state: 'running', evidence: 'observation_pid_alive' };
+  }
+  // Blocking pass 3b -- a declared transition anywhere in the set wins.
+  for (const candidate of candidates) {
+    if (['starting', 'stopping', 'restarting'].includes(candidate.state)) {
+      return { state: 'starting', evidence: 'observation_transition' };
+    }
+  }
+  // Blocking pass 3c -- a `running` claim with no usable pid is unresolved.
+  // Reading it as "the pid died" would DELETE a service the observer still
+  // reports as running, so it may only ever block here (never permit).
+  for (const candidate of candidates) {
+    if (candidate.state === 'running' && pidOf(candidate) === null) {
+      return { state: 'running', evidence: 'observation_running_without_pid' };
+    }
+  }
+
+  // Permitting pass -- reached only after 3a/3b/3c saw the entire set, so no
+  // blocking evidence can be hiding behind the row examined here.
+  for (const candidate of candidates) {
+    if (candidate.state === 'running' || candidate.state === 'starting') {
+      const pid = pidOf(candidate);
+      if (pid) {
+        // Observed running with a real pid that no longer exists: converged to absent.
+        return { state: 'stopped', evidence: 'observation_dead_pid' };
+      }
+      continue;
+    }
+    if (candidate.state === 'stopped') {
+      // Every real writer of a service-keyed `stopped` row does so only AFTER an
+      // authoritative absence check (a verified stop receipt, or an inspection
+      // that reported running === false), and `peekTunnelClient` already labels
+      // the rows it INVENTED with `synthetic: true`, which is filtered out above.
+      // main.mjs is one such writer and does not set the flag, so demanding the
+      // flag here would strand a genuinely-verified absence as `unknown` and
+      // re-open the removal deadlock this function exists to break.
+      return { state: 'stopped', evidence: 'observation_stopped' };
+    }
+  }
+
+  if (rt?.state === 'stopped' && !rows.some(row => isAlive(pidOf(row)))) {
+    return { state: 'stopped', evidence: 'dto_state_stopped_no_live_pid' };
+  }
+
+  const anyLiveInstance = rows.some(row => isAlive(pidOf(row)));
+  if (rows.length > 0 && rows.every(row => pidOf(row) !== null && !isAlive(pidOf(row)))) {
+    // Every instance row carries a REAL pid that no longer exists: those claims
+    // have converged to absent. Rows WITHOUT a pid are deliberately excluded --
+    // a missing identity is "unobserved", not "verified gone", so it may not
+    // become absence proof (plan: synthetic / missing observation / unknown
+    // identity / an empty instance array are never proof of stopped).
+    return { state: 'stopped', evidence: 'instance_pids_absent' };
+  }
+
+  const pointerAbsent = ['stopped', 'not_running', 'never_started'].includes(rt?.runtimeState);
+  if (!anyLiveInstance && pointerAbsent) {
+    return { state: 'stopped', evidence: 'pointer_absent_no_live_process' };
+  }
+
+  return { state: 'unknown', evidence: 'no_absence_evidence' };
+}
+
 export function attachRegistry({
   db,
   vault,
@@ -393,9 +535,30 @@ export function attachRegistry({
   assertIdle,
   getServiceRuntime,
   clearActiveService,
-  observer: initialObserver = null
+  observer: initialObserver = null,
+  maxPendingActions: maxPendingActionsOption = 64,
+  reservedCriticalActions: reservedCriticalActionsOption = 8
 }) {
   let observer = initialObserver;
+  const maxPendingActions = Number.isSafeInteger(maxPendingActionsOption) && maxPendingActionsOption >= 0
+    ? maxPendingActionsOption : 64;
+  const reservedCriticalActions = Number.isSafeInteger(reservedCriticalActionsOption)
+    && reservedCriticalActionsOption >= 0 ? reservedCriticalActionsOption : 8;
+
+  function assertActionQueueCapacity(serviceDef) {
+    let row;
+    try {
+      row = db.prepare("SELECT COUNT(*) AS n FROM mcp_actions WHERE state = 'QUEUED'").get();
+    } catch (_) {
+      // An unreadable queue must not be treated as empty.
+      throw new RegistryStoreError('Action queue capacity could not be verified', 503, 'ACTION_QUEUE_UNVERIFIED');
+    }
+    const pending = Number(row?.n ?? 0);
+    const limit = maxPendingActions + (serviceDef?.controlCarrier ? reservedCriticalActions : 0);
+    if (Number.isFinite(pending) && pending >= limit) {
+      throw new RegistryStoreError(`Action queue full (${pending}/${limit})`, 429, 'ACTION_QUEUE_FULL');
+    }
+  }
   if (!db || typeof db.exec !== 'function' || typeof db.prepare !== 'function') {
     throw new TypeError('attachRegistry requires a synchronous SQLite db (node:sqlite DatabaseSync)');
   }
@@ -446,6 +609,14 @@ export function attachRegistry({
     INSERT OR IGNORE INTO metadata (key, value) VALUES ('revision', '0');
     INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_gated', '0');
     INSERT OR IGNORE INTO metadata (key, value) VALUES ('recovery_reason', '');
+
+    -- Instance-scoped recovery gates (see src/store.mjs). Declared here too so a
+    -- registry store opened on its own never writes to a missing table.
+    CREATE TABLE IF NOT EXISTS recovery_gates (
+      scope TEXT PRIMARY KEY,
+      reason TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   // Additive migrations for existing databases (must be no-ops on fresh DBs).
@@ -1017,17 +1188,17 @@ export function attachRegistry({
       );
 
       const rt = fetchServiceRuntime(id);
-      // The runtime DTO does not carry a top-level `state`: the store returns
-      // {runtimeState, activeProfileId, instances}, and only formatRuntime() derives
-      // `state`. Reading rt?.state alone therefore produced 'unknown' for every service,
-      // so removal always failed with RUNTIME_STATE_UNKNOWN and nothing could be deleted.
-      // Prefer the tunnelClient observation (same source the service card and the frontend
-      // canDeleteMcp() use), then the legacy runtimeState field.
-      const runtimeState =
-        rt?.tunnelClient?.state ||
-        rt?.state ||
-        rt?.runtimeState ||
-        'unknown';
+      // The runtime DTO is a set of CLAIMS: {runtimeState, activeProfileId,
+      // instances} carries no live process fact, and `runtimeState` is derived
+      // from the legacy active-profiles pointer alone. Reading it directly made
+      // a pointer left by a dead tunnel look "running" forever. Resolve instead
+      // from the real observer plus a synchronous liveness pass over every
+      // instance row; see resolveRemovalRuntimeState for the evidence rules.
+      const runtimeState = resolveRemovalRuntimeState({
+        serviceId: id,
+        rt,
+        observer
+      }).state;
 
       let busy = false;
       if (typeof assertIdle === 'function') {
@@ -1193,9 +1364,12 @@ export function attachRegistry({
       }
     }
 
-    // 2. Initial busy check outside transaction
+    // 2. Initial busy check outside transaction.
+    // Contract §2.3: an instance-scoped action must not be blocked by a pending action
+    // for a DIFFERENT instance. This pre-transaction check has to honour the same rule
+    // as the in-transaction recheck below, otherwise it rejects before ever reaching it.
     if (typeof assertIdle === 'function') {
-      assertIdle();
+      assertIdle({ allowParallelInstanceAction: resolvedInstanceId });
     }
 
     // 3. Initial revision check outside transaction
@@ -1218,6 +1392,13 @@ export function attachRegistry({
     if (action !== 'stop' && serviceDef.enabled === false) {
       throw new RegistryStoreError(`Service '${serviceId}' is disabled`, 409, 'SERVICE_DISABLED');
     }
+
+    // Bounded intake for NEW work. The runner executes actions serially, so an
+    // unbounded QUEUED backlog only hides congestion. A control-carrier action
+    // (server-side definition flag, never caller input) keeps a reserved slot so
+    // the GPT control chain still gets through. Already accepted rows are never
+    // dropped by this check.
+    assertActionQueueCapacity(serviceDef);
 
     // Verify profile if start/restart
     let resolvedProfileId = profileId;
@@ -1297,9 +1478,11 @@ export function attachRegistry({
         }
       }
 
-      // Recheck busy inside sync transaction
+      // Recheck busy inside sync transaction.
+      // Contract §2.3: an instance-scoped action may queue alongside OTHER instances;
+      // only a legacy whole-service action or an action on the SAME instance conflicts.
       if (typeof assertIdle === 'function') {
-        assertIdle();
+        assertIdle({ allowParallelInstanceAction: resolvedInstanceId });
       }
 
       // Recheck revision inside sync transaction
@@ -1307,6 +1490,10 @@ export function attachRegistry({
       if (expectedRevision !== undefined && expectedRevision !== null && expectedRevision !== latestRev) {
         throw new RegistryStoreError(`Revision conflict: expected ${expectedRevision}, global revision is ${latestRev}`, 409, 'REVISION_CONFLICT');
       }
+
+      // Recheck capacity inside the transaction: concurrent callers can race the
+      // pre-check, and the last one must see the true QUEUED count.
+      assertActionQueueCapacity(serviceDef);
 
       const now = new Date().toISOString();
       try {
@@ -1490,17 +1677,27 @@ export function attachRegistry({
     return await finishLifecycleAction(id, receipt, { action: 'stop' });
   }
 
-  async function finishLifecycleAction(id, receipt, { action = 'stop', profileId = null } = {}) {
+  async function finishLifecycleAction(id, receipt, { action = 'stop', profileId = null, instanceId = null } = {}) {
     return await runWriteTransaction(() => {
       const row = db.prepare('SELECT * FROM mcp_actions WHERE id = ?').get(id);
       if (!row) {
         throw new RegistryStoreError(`Action '${id}' not found`, 404, 'ACTION_NOT_FOUND');
       }
+      // Stop receipts are always validated, whichever scope the action belongs to.
       if (action === 'stop') {
         assertStoppedConnectionReceipt(receipt, id, row.service_id);
-        handleClearActiveService(row.service_id);
-      } else if (profileId) {
-        handleSetActiveService(row.service_id, profileId);
+      }
+      // The legacy single-active pointer is ADVANCED ONLY by whole-service actions.
+      // A concurrent instance action targets one profile of several that may run at
+      // once, so it must never move (or clear) the pointer: doing so would report the
+      // service as stopped while a tunnel is live, show the wrong active account, and
+      // silently retarget a later legacy start that resolves its profile from here.
+      if (!instanceId) {
+        if (action === 'stop') {
+          handleClearActiveService(row.service_id);
+        } else if (profileId) {
+          handleSetActiveService(row.service_id, profileId);
+        }
       }
 
       const now = new Date().toISOString();
@@ -1540,9 +1737,23 @@ export function attachRegistry({
       `).run(code, now, id);
 
       const reason = `Action ${id} ended in NEEDS_ATTENTION: ${code}`;
+      /*
+       * Scope the gate to the instance that actually failed. A legacy action
+       * (instance_id IS NULL) covers the whole service, so it keeps opening the
+       * global gate; a concurrent instance action only gates its own instance and
+       * leaves sibling accounts runnable.
+       */
+      const scopeInstanceId = row.instance_id || null;
       try {
-        db.prepare("UPDATE metadata SET value = '1' WHERE key = 'recovery_gated'").run();
-        db.prepare("UPDATE metadata SET value = ? WHERE key = 'recovery_reason'").run(reason);
+        if (scopeInstanceId) {
+          db.prepare(`
+            INSERT INTO recovery_gates (scope, reason, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(scope) DO UPDATE SET reason = excluded.reason, updated_at = excluded.updated_at
+          `).run(String(scopeInstanceId), reason, now);
+        } else {
+          db.prepare("UPDATE metadata SET value = '1' WHERE key = 'recovery_gated'").run();
+          db.prepare("UPDATE metadata SET value = ? WHERE key = 'recovery_reason'").run(reason);
+        }
       } catch {}
 
       return {

@@ -39,3 +39,8 @@ __pycache__/
 *.pyc
 *.pid.json
 .mcp-release-temp/
+# 本机验证产物与 Windows 保留名残留（不得提交）
+artifacts/
+nul
+pip-build-env-*/
+pip-*/

@@ -3,6 +3,8 @@ import { publicEnvironment } from '../core/mcp-registry-policy.mjs';
 import { publicBinding, isSensitiveName } from '../adapters/mcp-binding.mjs';
 import { normalizeObservation } from '../adapters/runtime-observer.mjs';
 import { issueCarrierConfirmation, verifyCarrierConfirmation } from '../core/carrier-confirmation.mjs';
+import { publicInstanceDTO } from '../core/concurrent-instances.mjs';
+import { isProcessAlive, reconcileStaleRunning } from '../core/process-liveness.mjs';
 
 const VALID_REVEAL_ROLES = new Set([
   'sourceConfig',
@@ -183,6 +185,28 @@ export function sanitizeMcpDto(def) {
     };
   }
 
+  /*
+   * Concurrent multi-profile instances (contract §4).
+   *
+   * `result.runtime` above is REBUILT field by field, so the additive `instances`
+   * array has to be carried over explicitly — otherwise the store-provided rows are
+   * stripped here and `GET /api/mcps` (the response public/app.js prefers over
+   * /api/state) returns none, leaving the instance panel permanently empty.
+   *
+   * Every entry is re-projected through `publicInstanceDTO`, which is the redaction
+   * boundary: it drops anything not on its allow-list, so no raw tunnel id, api key,
+   * sealed credential or absolute production path can ride along from the store.
+   */
+  result.runtime.instances = Array.isArray(def.runtime?.instances)
+    ? def.runtime.instances
+        .map(instance => publicInstanceDTO({
+          ...instance,
+          serviceId: instance?.serviceId || def.id,
+          instanceId: instance?.instanceId || instance?.instance_id || null
+        }))
+        .filter(dto => dto && dto.instanceId)
+    : [];
+
   const rawTc = def.runtime?.tunnelClient;
   if (rawTc && typeof rawTc === 'object') {
     const VALID_TC_STATES = new Set(['running', 'stopped', 'starting', 'stopping', 'restarting', 'failed', 'unmanaged', 'unobserved']);
@@ -208,6 +232,75 @@ export function sanitizeMcpDto(def) {
   }
 
   return result;
+}
+
+/**
+ * Downgrades published `running` claims whose process is already gone.
+ *
+ * `instance_runtime` rows and the observer cache are CLAIMS, not live
+ * observations: after a crash, a machine sleep, or an externally killed
+ * tunnel-client they keep saying `running`, and `GET /api/mcps` — the projection
+ * public/app.js renders — used to publish that claim verbatim. The console then
+ * showed a phantom running instance, and "parallel start" skipped an account that
+ * was in fact down. A dead pid can never mean running, so this only ever
+ * DOWNGRADES the published view; the stored row is left untouched because the
+ * lifecycle owns state transitions and writes them only after a verified effect.
+ *
+ * Pure: the input DTO is never mutated (formatRuntime forwards provider arrays by
+ * reference, so an in-place edit here could corrupt the provider cache).
+ */
+export function reconcilePublishedLiveness(dto) {
+  if (!dto || typeof dto !== 'object') return dto;
+  const runtime = dto.runtime;
+  if (!runtime || typeof runtime !== 'object') return dto;
+
+  const instances = Array.isArray(runtime.instances)
+    ? runtime.instances.map(instance => reconcileStaleRunning(instance))
+    : runtime.instances;
+
+  // The service-level tunnel-client projection carries its own state/pid pair and
+  // its own (smaller) shape, so it is downgraded field by field instead of being
+  // passed through reconcileStaleRunning (which would add ownership fields this
+  // DTO never has).
+  let tunnelClient = runtime.tunnelClient;
+  let tunnelClientDowngraded = false;
+  if (tunnelClient && typeof tunnelClient === 'object'
+      && tunnelClient.state === 'running' && !isProcessAlive(tunnelClient.pid)) {
+    tunnelClient = {
+      ...tunnelClient,
+      state: 'stopped',
+      pid: null,
+      reasonCode: 'process_not_found',
+      observedAt: new Date().toISOString()
+    };
+    tunnelClientDowngraded = true;
+  }
+
+  const next = { ...runtime };
+  if (runtime.instances !== undefined) next.instances = instances;
+  if (runtime.tunnelClient !== undefined) next.tunnelClient = tunnelClient;
+
+  // `runtime.state` is derived from the persisted `active_profiles` pointer, not
+  // from a probe, so it survives a crash. Publishing it beside downgraded rows made
+  // one payload say "running" and "stopped" at once, and the console paints its
+  // live dot from this field (public/app.js). Only downgrade on affirmative
+  // evidence, so a service with no instance rows is never declared stopped.
+  if (next.state === 'running') {
+    const instanceEvidence = Array.isArray(instances) && instances.length > 0
+      && !instances.some(instance => instance && instance.state === 'running');
+    if (tunnelClientDowngraded || instanceEvidence) next.state = 'stopped';
+  }
+
+  return { ...dto, runtime: next };
+}
+
+/**
+ * The single funnel every MCPS response goes through: redact, then reconcile
+ * liveness. Keep create/update/list on it so a future endpoint cannot publish a
+ * raw claim by forgetting one of the two steps.
+ */
+export function publishMcpDto(dto) {
+  return reconcilePublishedLiveness(sanitizeMcpDto(dto));
 }
 
 /**
@@ -329,7 +422,11 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
           verified = false;
         }
       } else {
-        verified = true;
+        // No verifier means no proof of identity. This used to set
+        // `verified = true`, so an adapter without a process controller published a
+        // verified identity for a pid that was merely alive -- a recycled pid would
+        // inherit this service's carrier-gated stop/restart authority.
+        verified = false;
       }
       const executablePath = inspected?.executablePath || inspected?.executable || recordedProc?.executablePath || recordedProc?.executable;
       const startedAt = inspected?.startedAt || inspected?.startTime || recordedProc?.startedAt;
@@ -348,7 +445,12 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
         absenceVerified: false
       };
     } else {
-      const absenceVerified = Boolean(inspected && inspected.running === false) || (!live && !recordedProc);
+      // Only an authoritative inspection that explicitly reported `running: false`
+      // may claim absence. The old `|| (!live && !recordedProc)` half treated
+      // "nothing was observed and no launch record exists" as proven absence, which
+      // let an uninspectable adapter hand out a carrier token for a stop that was
+      // never verified.
+      const absenceVerified = Boolean(inspected && inspected.running === false);
       return {
         identity: null,
         absenceVerified
@@ -405,7 +507,7 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
           } else if (typeof repo?.listServices === 'function') {
             mcps = await repo.listServices();
           }
-          const safeMcps = Array.isArray(mcps) ? mcps.map(sanitizeMcpDto) : [];
+          const safeMcps = Array.isArray(mcps) ? mcps.map(publishMcpDto) : [];
           const revision = await getRev();
           sendJson(res, 200, { mcps: safeMcps, revision });
           return true;
@@ -419,7 +521,7 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             return true;
           }
           const created = await repo.registry.create(payload, { expectedRevision });
-          const safeMcp = sanitizeMcpDto(created);
+          const safeMcp = publishMcpDto(created);
           const revision = await getRev();
           sendJson(res, 201, { mcp: safeMcp, revision });
           return true;
@@ -450,7 +552,7 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             return true;
           }
 
-          const safeMcp = sanitizeMcpDto(mcp);
+          const safeMcp = publishMcpDto(mcp);
           const revision = await getRev();
           sendJson(res, 200, { mcp: safeMcp, revision });
           return true;
@@ -465,7 +567,7 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             return true;
           }
           const updated = await repo.registry.update(id, payload, { expectedRevision });
-          const safeMcp = sanitizeMcpDto(updated);
+          const safeMcp = publishMcpDto(updated);
           const revision = await getRev();
           sendJson(res, 200, { mcp: safeMcp, revision });
           return true;
@@ -506,8 +608,11 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             return true;
           }
 
-          const runtime = repo?.registry && typeof repo.registry.getServiceRuntime === 'function'
-            ? await repo.registry.getServiceRuntime(id)
+          // `attachRegistry` does not export getServiceRuntime, so resolving it from
+          // `repo.registry` always yielded null and locations.describe() lost the
+          // runtime facts. Read it from the store that actually owns the reader.
+          const runtime = typeof repo?.getServiceRuntime === 'function'
+            ? await repo.getServiceRuntime(id)
             : null;
 
           const locationDto = await locations.describe(def, runtime);
@@ -538,8 +643,8 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             return true;
           }
 
-          const runtime = repo?.registry && typeof repo.registry.getServiceRuntime === 'function'
-            ? await repo.registry.getServiceRuntime(id)
+          const runtime = typeof repo?.getServiceRuntime === 'function'
+            ? await repo.getServiceRuntime(id)
             : null;
 
           const revealResult = await locations.reveal(def, role, runtime);
@@ -572,12 +677,27 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
 
           // Check if already running with same profile (fast noop check)
           const obs = repo?.registry?.getObserver ? repo.registry.getObserver() : repo?.getObserver?.();
+          // `repo.registry` does NOT export getServiceRuntime (see the attachRegistry
+          // return block), so the old `registry.getServiceRuntime?.(id)?.tunnelClient`
+          // half of this fallback could never fire -- it only suggested a second
+          // observation source that does not exist. The store's own reader is the
+          // only real one.
           const currentTc = obs?.peekTunnelClient
             ? obs.peekTunnelClient(id)
-            : (repo?.registry?.getServiceRuntime?.(id)?.tunnelClient || repo?.getServiceRuntime?.(id)?.tunnelClient || null);
+            : (typeof repo?.getServiceRuntime === 'function' ? repo.getServiceRuntime(id)?.tunnelClient ?? null : null);
           if (currentTc?.state === 'running' && (!payload?.profileId || payload.profileId === currentTc.profileId)) {
-            sendJson(res, 200, { decision: 'noop', code: 'ALREADY_RUNNING', pid: currentTc.pid, serviceId: id });
-            return true;
+            // The observer is a cache and can outlive the process (externally killed
+            // client, console crash, or the "close all tunnel-client" button), so a
+            // `running` claim is only a no-op when its pid is actually alive.
+            // Trusting it blindly answered "已在运行 (PID: …)" for a dead pid while the
+            // reconciled dashboard showed the very same service as stopped, and the
+            // retry could never succeed because nothing invalidated the cache.
+            const livePid = Number.isSafeInteger(currentTc.pid) && currentTc.pid > 0 ? currentTc.pid : null;
+            if (livePid && isProcessAlive(livePid)) {
+              sendJson(res, 200, { decision: 'noop', code: 'ALREADY_RUNNING', pid: livePid, serviceId: id });
+              return true;
+            }
+            try { if (typeof obs?.invalidate === 'function') obs.invalidate(id); } catch {}
           }
 
           if (!payload?.profileId || typeof payload.profileId !== 'string' || !payload.profileId.trim()) {
@@ -851,16 +971,25 @@ export function createMcpRoutes({ repo, runner, discovery, importer, locations, 
             }
           }
 
-          // Check if already stopped (fast noop check)
-          const obs = repo?.registry?.getObserver ? repo.registry.getObserver() : repo?.getObserver?.();
-          const currentTc = obs?.peekTunnelClient
-            ? obs.peekTunnelClient(id)
-            : (repo?.registry?.getServiceRuntime?.(id)?.tunnelClient || repo?.getServiceRuntime?.(id)?.tunnelClient || null);
-          if (currentTc?.state === 'stopped' && currentTc?.absenceVerified) {
-            sendJson(res, 200, { decision: 'noop', code: 'ALREADY_STOPPED', serviceId: id });
-            return true;
-          }
-
+          /*
+           * The ALREADY_STOPPED fast noop that used to sit here has been REMOVED.
+           *
+           * It answered 200 "already stopped" straight from the observer cache. A
+           * cached absence is a PAST observation, and it proves nothing about the
+           * present: a tunnel restarted elsewhere, a recycled pid, or a stale row
+           * left by a crashed console would all be reported as a successful stop
+           * without anything being inspected or stopped. That is a false success on
+           * a destructive verb, which is worse than doing the work.
+           *
+           * Stop now always creates a lifecycle action. The runner performs a fresh
+           * authoritative inspection under its exclusive lock, and
+           * decideTunnelClientAction may still resolve to a genuine noop -- but only
+           * from evidence gathered NOW. The observer keeps recording verified stop
+           * events for display; it is no longer an authorization source.
+           *
+           * The equivalent fast path for START is kept because it is guarded by a
+           * real liveness probe on the recorded pid, not by cache alone.
+           */
           if (!repo?.registry || (typeof repo.registry.createLifecycleAction !== 'function' && typeof repo.registry.createStopAction !== 'function')) {
             sendError(res, 500, 'REGISTRY_NOT_INITIALIZED');
             return true;

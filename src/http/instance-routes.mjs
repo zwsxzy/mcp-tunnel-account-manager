@@ -15,6 +15,7 @@
  * `/api/mcps/:id/start|restart|stop` or `/api/mcps/:id`.
  */
 
+import fs from 'node:fs';
 import {
   sanitizeProfileSegment,
   buildInstanceId,
@@ -22,6 +23,7 @@ import {
   InstanceFault
 } from '../core/concurrent-instances.mjs';
 import { issueCarrierConfirmation, verifyCarrierConfirmation } from '../core/carrier-confirmation.mjs';
+import { isProcessAlive, reconcileStaleRunning } from '../core/process-liveness.mjs';
 
 const INSTANCE_ACTIONS = new Set(['start', 'stop', 'restart']);
 
@@ -193,7 +195,11 @@ export function createInstanceRoutes({
   runner,
   vault,
   instanceAdapterProvider = null,
-  dataDir = null
+  dataDir = null,
+  // Authoritative identity verifier for the persisted-record fallback. Must be
+  // processController.verify or equivalent; when absent the fallback can only
+  // degrade to `unverified` (see getInstanceProcessIdentity).
+  verifyProcessIdentity = null
 } = {}) {
   let lazyProvider = null;
   let lazyProviderAttempted = false;
@@ -275,7 +281,8 @@ export function createInstanceRoutes({
             const built = mod.createInstanceAdapterProvider({
               dataDir: dir,
               vault,
-              definitions: Array.isArray(definitions) ? definitions : undefined
+              definitions: Array.isArray(definitions) ? definitions : undefined,
+              resolveDefinition: loadServiceDefinition
             });
             if (typeof built === 'function') lazyProvider = built;
           }
@@ -339,6 +346,12 @@ export function createInstanceRoutes({
       try { live = obs.peekTunnelClient(instanceId); } catch (_) { live = null; }
       if (!live || typeof live !== 'object') return row;
 
+      // A synthetic value is the observer's "I have nothing cached" placeholder,
+      // not an observation. It carries observedAt = now, so it would always outrank
+      // the stored record and turn a LIVE instance into a phantom "stopped" row —
+      // worse than the staleness this overlay was added to fix.
+      if (live.synthetic === true) return row;
+
       // Drop stale cache rows entirely.
       const expires = toMs(live.expiresAt);
       if (Number.isFinite(expires) && expires <= now) return row;
@@ -356,9 +369,18 @@ export function createInstanceRoutes({
       if (typeof live.reasonCode === 'string' && live.reasonCode) merged.reasonCode = live.reasonCode;
       if (Number.isFinite(liveAt)) merged.observedAt = new Date(liveAt).toISOString();
       if (live.managed === true) merged.managed = true;
+      // Ownership evidence travels with the live observation so the row keeps
+      // offering stop/restart. Only affirmative evidence is merged: absence of the
+      // field must never be read as "owned".
+      if (live.owned === true) merged.owned = true;
+      if (live.identityVerified === true) merged.identityVerified = true;
 
       // Running means a live pid; stopped means no pid.
-      if (merged.state === 'stopped') merged.pid = null;
+      if (merged.state === 'stopped') {
+        merged.pid = null;
+        merged.owned = false;
+        merged.identityVerified = false;
+      }
       return merged;
     });
   }
@@ -371,6 +393,10 @@ export function createInstanceRoutes({
     }
     let rows = await listStoredInstances(serviceId);
     rows = overlayObserver(Array.isArray(rows) ? rows : [], serviceId);
+    // Both sides can hand back a `running` claim whose process is already gone: a
+    // stored row survives a crash, and the observer is a cache that can outlive
+    // the pid. Downgrade before publishing so the list never invents a live one.
+    rows = rows.map(row => reconcileStaleRunning(row));
     const instances = rows
       .map(record => publicInstanceDTO({
         ...record,
@@ -463,14 +489,23 @@ export function createInstanceRoutes({
       let current = null;
       try { current = obs.peekTunnelClient(instanceId); } catch (_) { current = null; }
       if (action === 'start' && current?.state === 'running') {
-        sendJson(res, 200, {
-          decision: 'noop',
-          code: 'ALREADY_RUNNING',
-          pid: Number.isSafeInteger(current.pid) && current.pid > 0 ? current.pid : null,
-          serviceId,
-          instanceId
-        });
-        return true;
+        const livePid = Number.isSafeInteger(current.pid) && current.pid > 0 ? current.pid : null;
+        // The observer cache can outlive the process (killed externally, or by the
+        // "close all tunnel-client" button). Trusting it blindly turned a real start
+        // into a noop that silently did nothing. Only treat ALREADY_RUNNING as true
+        // when the recorded pid is actually alive; otherwise drop the stale entry.
+        if (livePid && isProcessAlive(livePid)) {
+          sendJson(res, 200, {
+            decision: 'noop',
+            code: 'ALREADY_RUNNING',
+            pid: livePid,
+            serviceId,
+            instanceId
+          });
+          return true;
+        }
+        try { if (typeof obs.invalidate === 'function') obs.invalidate(instanceId); } catch (_) {}
+        current = null;
       }
       if (action === 'stop' && current?.state === 'stopped' && current?.absenceVerified) {
         sendJson(res, 200, {
@@ -614,9 +649,65 @@ export function createInstanceRoutes({
    *      writes after a verified start/stop — a legitimate server-side fact.
    *   3. Degrade to `{unverified:true}` so carrier-gated actions are refused
    *      rather than silently bound to a wrong identity.
+   *
+   * OWNERSHIP, not just self-consistency: `verify(inspected)` only proves that the
+   * process the OS reports right now matches ITSELF. After pid reuse it happily
+   * validates whatever now owns that pid, so the identity that must be handed to
+   * the verifier is the one this instance was LAUNCHED with (the adapter's launch
+   * record, else the persisted instance row). The inspected pid must equal that
+   * expected pid before the verifier is consulted at all.
    */
   async function getInstanceProcessIdentity({ serviceId, profileId, instanceId }) {
     const provider = await resolveInstanceProvider();
+
+    // Persisted expected identity, read once: it is the only thing that ties a
+    // live pid to THIS instance rather than to whatever recycled it.
+    let record = null;
+    try {
+      if (typeof repo?.getInstanceRuntime === 'function') {
+        record = await repo.getInstanceRuntime(instanceId);
+      } else if (typeof repo?.registry?.getInstanceRuntime === 'function') {
+        record = await repo.registry.getInstanceRuntime(instanceId);
+      }
+    } catch (_) {
+      record = null;
+    }
+
+    /** Normalizes a launch/persisted record into the expected-identity shape. */
+    const expectedFrom = (src) => {
+      if (!src || typeof src !== 'object') return null;
+      const pid = Number.isSafeInteger(src.pid) && src.pid > 0 ? src.pid : null;
+      const startedAt = typeof (src.startedAt || src.startTime) === 'string'
+        ? (src.startedAt || src.startTime) : null;
+      const executablePath = typeof (src.executablePath || src.executable) === 'string'
+        ? (src.executablePath || src.executable) : null;
+      if (!pid || !startedAt || !executablePath) return null;
+      return { pid, startedAt, executablePath };
+    };
+
+    /** Reads the adapter's own launch record (written when this instance started). */
+    const expectedFromAdapter = (adapter) => {
+      const p = adapter?.processPath;
+      if (typeof p !== 'string' || !p) return null;
+      try {
+        if (!fs.existsSync(p)) return null;
+        return expectedFrom(JSON.parse(fs.readFileSync(p, 'utf8')));
+      } catch (_) {
+        return null;
+      }
+    };
+
+    /** Consults a controller verifier against an EXPLICIT expected identity. */
+    const verifyAgainst = async (controller, expected) => {
+      if (!expected) return false;
+      if (typeof controller?.verify !== 'function') return false;
+      try {
+        const v = await controller.verify(expected);
+        return v?.valid === true;
+      } catch (_) {
+        return false;
+      }
+    };
 
     if (typeof provider === 'function') {
       let adapter = null;
@@ -643,21 +734,19 @@ export function createInstanceRoutes({
 
         if (!failed && inspected && typeof inspected === 'object') {
           if (inspected.running && inspected.pid > 0) {
-            let verified = false;
-            if (typeof adapter.processController?.verify === 'function') {
-              try {
-                const v = await adapter.processController.verify(inspected);
-                verified = Boolean(v?.valid);
-              } catch (_) {
-                verified = false;
-              }
-            }
+            // The expected identity decides whether this pid is OURS.
+            const expected = expectedFromAdapter(adapter)
+              || (record && record.state === 'running' ? expectedFrom(record) : null);
+            // A live pid with no expected identity is an unowned process: it must
+            // never become the target of a carrier-bound stop/restart.
+            if (!expected || expected.pid !== inspected.pid) return { unverified: true };
+            const verified = await verifyAgainst(adapter.processController, expected);
             if (!verified) return { unverified: true };
             return {
               identity: {
-                pid: inspected.pid,
-                startedAt: inspected.startedAt || inspected.startTime,
-                executablePath: inspected.executablePath || inspected.executable,
+                pid: expected.pid,
+                startedAt: expected.startedAt,
+                executablePath: expected.executablePath,
                 verified: true
               },
               absenceVerified: false
@@ -671,31 +760,38 @@ export function createInstanceRoutes({
       }
     }
 
-    // Fallback: the persisted instance runtime record.
-    let record = null;
-    try {
-      if (typeof repo?.getInstanceRuntime === 'function') {
-        record = await repo.getInstanceRuntime(instanceId);
-      } else if (typeof repo?.registry?.getInstanceRuntime === 'function') {
-        record = await repo.registry.getInstanceRuntime(instanceId);
+    // Fallback: the persisted instance runtime record is a CLAIM, never proof.
+    //
+    // This branch used to return {identity:{...}, verified:true} for any row that
+    // said `running` with a pid, and `absenceVerified:true` for any row that said
+    // `stopped`. Both feed carrier confirmation directly, and
+    // carrier-confirmation.mjs requires little more than `verified === true` plus
+    // a well-shaped identity -- so a tunnel that had already died still produced a
+    // valid carrier-management token bound to whatever now holds that pid.
+    //
+    // A stored `running` row is usable only when the pid is actually alive AND an
+    // authoritative verifier confirms executable path + creation time. Anything
+    // else (dead pid, missing verifier, verifier false/throwing, recycled pid)
+    // degrades to `unverified`, which makes carrier-gated actions refuse instead
+    // of binding a token to the wrong process. A stored `stopped`/`failed` row is
+    // NOT absence: only an authoritative inspection may claim that.
+    const persisted = record && record.state === 'running' ? expectedFrom(record) : null;
+    if (persisted) {
+      // Existence is not identity: a recycled pid would pass this alone.
+      if (!isProcessAlive(persisted.pid)) return { unverified: true };
+      if (typeof verifyProcessIdentity !== 'function') return { unverified: true };
+      let verified = false;
+      try {
+        const verdict = await verifyProcessIdentity(persisted);
+        verified = verdict?.valid === true;
+      } catch (_) {
+        verified = false;
       }
-    } catch (_) {
-      record = null;
-    }
-
-    if (record && typeof record === 'object') {
-      const pid = Number.isSafeInteger(record.pid) && record.pid > 0 ? record.pid : null;
-      const startedAt = typeof record.startedAt === 'string' ? record.startedAt : null;
-      const executablePath = typeof record.executablePath === 'string' ? record.executablePath : null;
-      if (record.state === 'running' && pid && startedAt && executablePath) {
-        return {
-          identity: { pid, startedAt, executablePath, verified: true },
-          absenceVerified: false
-        };
-      }
-      if (record.state === 'stopped' || record.state === 'failed') {
-        return { identity: null, absenceVerified: true };
-      }
+      if (!verified) return { unverified: true };
+      return {
+        identity: { ...persisted, verified: true },
+        absenceVerified: false
+      };
     }
 
     return { unverified: true };
