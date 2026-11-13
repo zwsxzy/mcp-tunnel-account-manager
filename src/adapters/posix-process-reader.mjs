@@ -324,7 +324,14 @@ export function createPosixProcessReader({
       try { if (await canonical(name) === executablePath) mappedMatch = true; }
       catch { /* unrelated inaccessible mappings do not prove the executable */ }
     }
-    if (!mappedMatch) throw control('POSIX_EXECUTABLE_PATH_UNVERIFIED');
+    if (!mappedMatch) {
+      // During exit lsof may succeed after the executable mapping has already
+      // disappeared. Its incomplete mappings prove nothing about process exit:
+      // require a separate successful ps observation of absence or a zombie.
+      const remaining = await readMetadata(pid, options);
+      if (!remaining || !remaining.running) return remaining && { ...remaining, executablePath: null };
+      throw control('POSIX_EXECUTABLE_PATH_UNVERIFIED');
+    }
     const commandLine = includeCommandLine ? await textField(pid, 'args', options) : null;
     const finalComm = await textField(pid, 'comm', options);
     const second = await readMetadata(pid, options);

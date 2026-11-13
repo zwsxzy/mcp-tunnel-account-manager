@@ -85,6 +85,54 @@ test('Darwin cannot establish executable identity from spoofed argv0 alone', asy
   await assert.rejects(reader.readProcess(4321), controlError('POSIX_EXECUTABLE_PATH_UNVERIFIED'));
 });
 
+test('Darwin rechecks exit independently when successful lsof output has lost the executable mapping', async t => {
+  for (const [mapping, output] of [['empty', ''], ['partial', 'p4321\0ftxt\0n/usr/lib/libSynthetic.dylib\0\n']]) {
+    for (const [state, finalMetadata] of [['absent', absent], ['zombie', ok(row(4321, '56', 'Z'))]]) {
+      await t.test(`${mapping} mappings with ${state} metadata`, async () => {
+        let metadataCalls = 0;
+        const { reader, calls } = darwinReader({ intercept(call) {
+          if (call.command === '/usr/sbin/lsof') return ok(output);
+          if (call.command === '/bin/ps' && call.args.at(-1).includes('lstart=')) {
+            metadataCalls += 1;
+            return metadataCalls === 1 ? ok(row()) : finalMetadata;
+          }
+        } });
+        const observed = await reader.readProcess(4321, { critical: true, includeCommandLine: false });
+        if (state === 'absent') assert.equal(observed, null);
+        else {
+          assert.equal(observed.running, false);
+          assert.equal(observed.state, 'Z');
+          assert.equal(observed.executablePath, null);
+        }
+        assert.equal(metadataCalls, 2, 'missing mapped text alone is never proof of exit');
+        assert.ok(calls.every(call => call.options.critical === true));
+      });
+    }
+  }
+});
+
+test('Darwin missing executable mappings do not disguise live processes, PID reuse or failed exit probes', async t => {
+  for (const [name, finalMetadata, helperCode] of [
+    ['still live', ok(row()), 'POSIX_EXECUTABLE_PATH_UNVERIFIED'],
+    ['reused PID', ok(row(4321, '57')), 'POSIX_EXECUTABLE_PATH_UNVERIFIED'],
+    ['ps failure', { code: 1, stdout: '', stderr: 'synthetic permission failure' }, 'POSIX_PS_FAILED'],
+    ['invalid ps success', ok(''), 'POSIX_PS_OUTPUT_INVALID']
+  ]) {
+    await t.test(name, async () => {
+      let metadataCalls = 0;
+      const { reader } = darwinReader({ intercept(call) {
+        if (call.command === '/usr/sbin/lsof') return ok('p4321\0n/usr/lib/libSynthetic.dylib\0\n');
+        if (call.command === '/bin/ps' && call.args.at(-1).includes('lstart=')) {
+          metadataCalls += 1;
+          return metadataCalls === 1 ? ok(row()) : finalMetadata;
+        }
+      } });
+      await assert.rejects(reader.readProcess(4321, { critical: true, includeCommandLine: false }), controlError(helperCode));
+      assert.equal(metadataCalls, 2);
+    });
+  }
+});
+
 test('Darwin detects a PID birth change across the inspection and does not claim absence', async () => {
   let metadataCalls = 0;
   const { reader } = darwinReader({ intercept(call) {
