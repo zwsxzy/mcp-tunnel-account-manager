@@ -990,10 +990,10 @@ export function createHttpServer({
       // 7b-2. Operator recovery reset: POST /api/recovery/reset (guarded, explicit confirm)
       //
       // Closes the recovery gate and parks every NEEDS_ATTENTION work item as REJECTED,
-      // WITHOUT touching a single process. POST /api/tunnel-clients/stop-all stops
-      // managed tunnels first — the wrong tool for a gate left open by an earlier failure
-      // (e.g. EXECUTABLE_NOT_FOUND, which the zero-effect acknowledge path above is
-      // forbidden to clear by design).
+      // WITHOUT touching a single process. POST /api/tunnel-clients/stop-all also resets
+      // the gate, but it kills every tunnel-client first — the wrong tool for a gate left
+      // open by an earlier failure (e.g. EXECUTABLE_NOT_FOUND, which the zero-effect
+      // acknowledge path above is forbidden to clear by design).
       if (pathname === '/api/recovery/reset') {
         if (method !== 'POST') return sendError(res, 405, 'METHOD_NOT_ALLOWED');
         const ok = await guarded({ write: true });

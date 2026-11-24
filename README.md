@@ -97,7 +97,7 @@ cd mcp-tunnel-account-manager
 
 双击 **`Start-Console.command`**，浏览器会打开：
 
-**<http://127.0.0.1:17642>**
+**<http://127.0.0.1:17643>**
 
 也可以在项目目录运行：
 
@@ -108,6 +108,16 @@ npm start
 ```
 
 保持启动它的终端窗口打开。按 **Control+C** 关闭控制台；需要停止隧道时，先在页面执行 **「关闭本控制台管理的隧道」**。
+
+习惯用后台方式？Mac 上用 `nohup npm start &` 启动后，按记录的 pid 关闭即可（本分支不提供按端口强杀的脚本）：
+
+```bash
+nohup npm start > console.log 2>&1 &
+echo $! > console.pid   # 记录本次启动的 pid，关闭时只停这个 pid
+kill "$(cat console.pid)"
+```
+
+如果页面提示「恢复闸门已触发 (NEEDS_ATTENTION)」而进程仍然正常，点 **「只清闸门（不动进程）」** 即可：它只把异常记录标记为 REJECTED 并解除闸门，不停止任何进程，且在写入前自动备份数据库。
 
 首次进入时输入引导码并设置管理员密码。引导码文件在：
 
@@ -318,12 +328,12 @@ DATA_DIR="$HOME/Library/Application Support/McpTunnelManager-Test" npm start
 
 | 变量 | 行为 |
 | --- | --- |
-| `PORT` | 控制台端口，默认 `17642` |
-| `HOST` | 只接受 `127.0.0.1` |
-| `DATA_DIR` | 控制台数据目录 |
+| `PORT` | 控制台端口，默认 `17643` |
+| `HOST` | 只接受 `127.0.0.1`，其他值会拒绝启动 |
+| `DATA_DIR` | 覆盖控制台数据目录 |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 按此顺序选择隧道代理；Mac 全部未设置时直接联网 |
 | `XDG_CONFIG_HOME` | tunnel-client 与 Overleaf 的配置根目录 |
-| `OVERLEAF_PROJECTS_CONFIG` | Overleaf 项目清单 |
+| `OVERLEAF_PROJECTS_CONFIG` | Overleaf 服务读取的 `projects.json` |
 | `OVERLEAF_MCP_WORKSPACE_DIR` | Overleaf 项目工作区 |
 | `ANTIGRAVITY_STATE_DIR` | Antigravity 任务状态目录 |
 
@@ -343,9 +353,11 @@ Finder 启动的进程不一定继承终端中临时 `export` 的变量。有自
 | 安装到一半失败 | 修复报错后重跑；校验通过的已安装组件会复用 |
 | 服务提示命令路径失效 | 查看 YAML 与 `.suggested`，确认程序真实路径，保留凭据后合并 |
 | 控制台端口被占用 | 使用 `PORT=17643 npm start`，或正常关闭已确认的旧控制台 |
+| 页面提示「恢复闸门已触发 (NEEDS_ATTENTION)」 | 先核对报错里的失败码与服务状态，再用「只清闸门（不动进程）」按钮；命令行等价：`node scripts/dev-reset-recovery-gate.mjs --apply`（默认 `<仓库>/data`；生产数据目录会被拒绝） |
 | 隧道连接失败 | 核对 Tunnel ID、Runtime API Key、网络与代理；并行实例使用不同 Tunnel ID |
 | Mac 休眠后状态需要刷新 | 等待重新探测；身份或退出未确认时不会盲目终止进程 |
 | MCP 已装好，但 Antigravity 任务失败 | 确认 IDE 已登录、运行且会话可用；查看 IDE 与 MCP 的业务错误 |
+| 中文用户名或路径包含空格 | 安装器已处理路径转义；仍失败时请提交脱敏后的完整错误 |
 | 忘记管理员密码 | 先备份整个数据目录；删除数据重新初始化会清空原账号库 |
 | 换电脑怎样迁移 | 备份数据与业务配置，在新电脑重新安装组件并核对路径；同时在线的电脑用不同 Tunnel ID |
 
@@ -378,6 +390,17 @@ node scripts/run-tests.mjs --unit \
 ```
 
 测试产物与用户运行状态均不提交到 Git。
+
+若某个数据目录遗留了 `NEEDS_ATTENTION` 恢复闸门（例如历史上的 `EXECUTABLE_NOT_FOUND`），页面上的「确认恢复」只接受零副作用错误码，需要显式工具解除（也可直接用页面上的「只清闸门（不动进程）」按钮）：
+
+```bash
+node scripts/dev-reset-recovery-gate.mjs           # 只看现状：默认目标 <仓库>/data，不写盘
+node scripts/dev-reset-recovery-gate.mjs --apply   # 先备份再清闸门
+```
+
+该工具只操作一个数据目录，拒绝生产目录（Windows 下为 `%LOCALAPPDATA%\McpTunnelAccountManager`），在控制台仍占用该目录时也会拒绝执行（`--force` 可显式越过）。
+
+相关文档：[构建说明](docs/BUILD-RELEASE.md) · [切换修复记录](docs/SAFE-SWITCH-FIX.zh-CN.md) · [部署与验证边界](docs/NEW-BRANCH-DEPLOY.zh-CN.md)。
 
 ## 参与项目
 

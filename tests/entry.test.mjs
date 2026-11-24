@@ -41,10 +41,12 @@ test('start script existence and Node.js >= 22 checks', () => {
   assert.match(cmdContent, /-Foreground/, 'CMD preserves the foreground console contract');
 
   const ps1Content = fs.readFileSync(ps1Path, 'utf8');
-  assert.match(ps1Content, /17642/, 'scripts/start-manager.ps1 should reference port 17642');
+  assert.match(ps1Content, /17643/, 'scripts/start-manager.ps1 should reference port 17643');
   assert.match(ps1Content, /node/i, 'scripts/start-manager.ps1 should verify node');
   assert.match(ps1Content, /22\.14\.0/, 'PowerShell checks the minimum supported Node runtime');
   assert.match(ps1Content, /launch-manager\.mjs/, 'PowerShell must call the guarded release launcher');
+  assert.match(ps1Content, /Join-Path \$taskRoot 'data'/, 'PowerShell script should default to repo data directory when present');
+  assert.match(ps1Content, /TUNNEL_CLIENT_BIN/, 'PowerShell script should configure TUNNEL_CLIENT_BIN');
   const launcherPath = path.join(projectRoot, 'scripts', 'launch-manager.mjs');
   assert.ok(fs.existsSync(launcherPath), 'guarded Node launcher must exist');
   const launcher = fs.readFileSync(launcherPath, 'utf8');
